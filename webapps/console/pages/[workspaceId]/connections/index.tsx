@@ -1,0 +1,526 @@
+import { WorkspacePageLayout } from "../../../components/PageLayout/WorkspacePageLayout";
+import { useWorkspace } from "../../../lib/context";
+import { get } from "../../../lib/useApi";
+import { DestinationConfig, FunctionConfig, ServiceConfig, StreamConfig } from "../../../lib/schema";
+import { ConfigurationObjectLinkDbModel } from "../../../prisma/schema";
+import { z } from "zod";
+import { Input, Table } from "antd";
+import { confirmOp, feedbackError, feedbackSuccess } from "../../../lib/ui";
+import React, { useState } from "react";
+import Link from "next/link";
+import { FaExternalLinkAlt, FaPlus, FaTrash } from "react-icons/fa";
+import { index, trimMiddle } from "juava";
+import { getCoreDestinationType } from "../../../lib/schema/destinations";
+import { useRouter } from "next/router";
+import { jsonSerializationBase64, useQueryStringState } from "../../../lib/useQueryStringState";
+import { TableProps } from "antd/es/table/InternalTable";
+import { ColumnType, SortOrder } from "antd/es/table/interface";
+import { Activity, Edit3, Inbox, Search, UserRoundPen, XCircle, Power, PowerOff } from "lucide-react";
+import { PlusOutlined } from "@ant-design/icons";
+import { WJitsuButton } from "../../../components/JitsuButton/JitsuButton";
+import { DestinationTitle } from "../destinations";
+import { ButtonGroup, ButtonProps } from "../../../components/ButtonGroup/ButtonGroup";
+import { StreamTitle } from "../streams";
+import { FunctionTitle } from "../functions";
+import omit from "lodash/omit";
+import { toURL } from "../../../lib/shared/url";
+import JSON5 from "json5";
+import {
+  useConfigObjectLinks,
+  useConfigObjectList,
+  useStoreReload,
+  useConfigObjectLinkMutation,
+} from "../../../lib/store";
+import { ServiceTitle } from "../services";
+import { ObjectTitle } from "../../../components/ObjectTitle/ObjectTitle";
+import { WLink } from "../../../components/Workspace/WLink";
+import { useAntdModal } from "../../../lib/modal";
+
+function EmptyLinks() {
+  const workspace = useWorkspace();
+  return (
+    <div>
+      <div className="flex flex-col items-center">
+        <div className="text-xl text-textLight mb-3">
+          {" "}
+          You don't have any links between <Link href={`/${workspace.slugOrId}/sites`}>sites</Link> and{" "}
+          <Link href={`/${workspace.slugOrId}/destinations`}>destinations</Link>
+        </div>
+
+        <WJitsuButton href={`/connections/edit`} type="link">
+          <span className="text-lg">Create your first connection</span>
+        </WJitsuButton>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * How to fit a connection title into a narrow space. `"none"` (default) renders the full names and
+ * lets the container clip them - which cuts the destination off at an arbitrary spot. A number
+ * trims *each* side to that many characters, in the middle, so both sides stay recognizable
+ */
+export type TruncationPolicy = "none" | number;
+
+const truncateTitle = (name: string, policy: TruncationPolicy) => (policy === "none" ? name : trimMiddle(name, policy));
+
+export const ConnectionTitle: React.FC<{
+  connectionId: string;
+  stream?: StreamConfig;
+  service?: ServiceConfig;
+  destination: DestinationConfig;
+  showLink?: boolean;
+  truncationPolicy?: TruncationPolicy;
+}> = ({ connectionId, stream, service, destination, showLink = false, truncationPolicy = "none" }) => {
+  const title = (o: { name: string }) => truncateTitle(o.name, truncationPolicy);
+  return (
+    <div className={"flex flex-row whitespace-nowrap gap-1.5"}>
+      {service && <ServiceTitle size={"small"} service={service} title={title} />}
+      {stream && <StreamTitle size={"small"} stream={stream} title={title} />}
+      {!stream && !service && "DELETED "}
+      {"➞"}
+      <DestinationTitle size={"small"} destination={destination} title={title} />
+      {showLink && (
+        <WJitsuButton
+          href={`/connections/edit?id=${connectionId}`}
+          type="link"
+          className="link"
+          size="small"
+          icon={<FaExternalLinkAlt className="w-2.5 h-2.5" />}
+        />
+      )}
+    </div>
+  );
+};
+
+export const ProfileBuilderTitle: React.FC<{
+  profileBuilder: any;
+  destination?: DestinationConfig;
+  showLink?: boolean;
+  truncationPolicy?: TruncationPolicy;
+}> = ({ profileBuilder, destination, showLink = false, truncationPolicy = "none" }) => {
+  return (
+    <div className={"flex flex-row whitespace-nowrap gap-1.5"}>
+      <ObjectTitle
+        icon={<UserRoundPen color={"black"} className={"w-4 h-4"} />}
+        size={"small"}
+        // href={stream && link ? `/${stream.workspaceId}/streams?id=${stream?.id}` : undefined}
+        title={profileBuilder ? truncateTitle(profileBuilder.name, truncationPolicy) : "Unknown stream"}
+      />
+      {destination && (
+        <>
+          {"→"}
+          <DestinationTitle
+            size={"small"}
+            destination={destination}
+            title={d => truncateTitle(d.name, truncationPolicy)}
+          />
+        </>
+      )}
+      {/*{showLink && (*/}
+      {/*  <WJitsuButton*/}
+      {/*    href={`/connection/edit?id=${connectionId}`}*/}
+      {/*    type="link"*/}
+      {/*    className="link"*/}
+      {/*    size="small"*/}
+      {/*    icon={<FaExternalLinkAlt className="w-2.5 h-2.5" />}*/}
+      {/*  />*/}
+      {/*)}*/}
+    </div>
+  );
+};
+
+type ConfigurationLinkDbModel = z.infer<typeof ConfigurationObjectLinkDbModel>;
+
+type RemoteEntitiesProps = {
+  streams: StreamConfig[];
+  destinations: DestinationConfig[];
+  links: Omit<ConfigurationLinkDbModel, "data">[];
+  functions: FunctionConfig[];
+  reloadCallback: () => void;
+};
+
+type SortingSettings = {
+  columns: { order: SortOrder; field: string }[];
+};
+
+function ConnectionsTable({ links, streams, destinations, functions, reloadCallback }: RemoteEntitiesProps) {
+  const streamsById = index(streams, "id");
+  const destinationsById = index(destinations, "id");
+  const functionsById = index(functions, "id");
+  const validLinks = links.filter(l => streamsById[l.fromId] && destinationsById[l.toId]);
+  const modal = useAntdModal();
+
+  const workspace = useWorkspace();
+  const router = useRouter();
+  const [showId, setShowId] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [sorting, setSorting] = useQueryStringState<SortingSettings>("sorting", {
+    defaultValue: { columns: [] },
+    ...jsonSerializationBase64,
+  });
+  const reloadStore = useStoreReload();
+
+  const onSaveMutation = useConfigObjectLinkMutation(async (obj: any) => {
+    await get(`/api/${workspace.id}/config/link`, {
+      body: obj,
+    });
+  });
+
+  const deleteConnection = async (link: Omit<ConfigurationLinkDbModel, "data">) => {
+    if (await confirmOp("Are you sure you want to unlink this site from this destination?")) {
+      setLoading(true);
+      try {
+        await get(`/api/${workspace.id}/config/link`, {
+          method: "DELETE",
+          query: { id: link.id },
+        });
+        await reloadStore();
+        feedbackSuccess("Successfully unliked");
+        reloadCallback();
+      } catch (e) {
+        feedbackError("Failed to unlink site and destination", { error: e });
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+  const onChange: TableProps<any>["onChange"] = (pagination, filters, sorter, { currentDataSource }) => {
+    const sortArray = Array.isArray(sorter) ? sorter : [sorter];
+    const columns = sortArray
+      .filter(s => !!s.column?.title && !!s.order)
+      .map(s => ({ field: s.column?.title, order: s.order }));
+    const newVal = {
+      columns: columns as any,
+    };
+    setSorting(newVal);
+  };
+  const columns: ColumnType<any>[] = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      width: "33%",
+      className: showId ? "" : "hidden",
+      render: (text, link) => {
+        return <div className="flex items-center text-text text-xs whitespace-nowrap">{link.id}</div>;
+      },
+    },
+    {
+      title: "Source",
+      width: "33%",
+      sortOrder: sorting.columns?.find(s => s.field === "Source")?.order,
+      sorter: (a, b) => {
+        const streamA = streamsById[a.fromId];
+        const streamB = streamsById[b.fromId];
+        return (streamA.name || "").localeCompare(streamB.name || "");
+      },
+      render: (text, link) => {
+        const stream = streamsById[link.fromId];
+        if (!stream) {
+          return <div>Stream not found</div>;
+        }
+        return (
+          <WLink href={`/connections/edit?id=${link.id}`}>
+            <StreamTitle stream={stream} />
+          </WLink>
+        );
+      },
+    },
+    {
+      title: "Destination",
+      width: "33%",
+      sortOrder: sorting.columns?.find(s => s.field === "Destination")?.order,
+
+      sorter: (a, b) => {
+        const destA = destinationsById[a.toId];
+        const destB = destinationsById[b.toId];
+        return (destA.name || "").localeCompare(destB.name || "");
+      },
+      render: (text, link) => {
+        const destination = destinationsById[link.toId];
+        if (!destination) {
+          return <div>Destination not found</div>;
+        }
+        return (
+          <WLink href={`/connections/edit?id=${link.id}`}>
+            <DestinationTitle destination={destination} />
+          </WLink>
+        );
+      },
+    },
+    {
+      title: "Functions",
+      width: "33%",
+      render: (text, link) => {
+        return (
+          <div className="flex flex-row flex-wrap items-center gap-1 gap-x-2.5">
+            {functions &&
+              (link.data?.functions || [])
+                .filter(f => f.functionId?.startsWith("udf."))
+                .map((f, i) => {
+                  const id = f.functionId?.replace("udf.", "");
+                  const func = functionsById[id];
+                  if (!func) {
+                    return <FunctionTitle size={"small"} key={i} title={() => f.functionId} />;
+                  }
+                  return (
+                    <div
+                      className="cursor-pointer"
+                      onClick={e => router.push(`/${workspace.slugOrId}/functions?id=${id}`)}
+                      key={i}
+                    >
+                      <FunctionTitle size={"small"} f={func} />
+                    </div>
+                  );
+                })}
+          </div>
+        );
+      },
+    },
+    {
+      title: <span onClick={() => setShowId(!showId)}>Actions</span>,
+      key: "actions",
+      render: (text, link) => {
+        const stream = streamsById[link.fromId];
+        const dst = destinationsById[link.toId];
+        const isEnabled = !link.data?.disabled;
+        let type = "function";
+        try {
+          if (getCoreDestinationType(dst.destinationType).usesBulker) {
+            type = "bulker";
+          }
+        } catch (e) {}
+        const items: ButtonProps[] = [
+          {
+            icon: isEnabled ? <PowerOff className={"w-4 h-4"} /> : <Power className={"w-4 h-4"} />,
+            label: isEnabled ? "Disable connection" : "Enable connection",
+            collapsed: true,
+            onClick: async () => {
+              modal.confirm({
+                title: `Are you sure you want to ${!isEnabled ? "enable" : "disable"} this connection?`,
+                content: (
+                  <>
+                    This will <b>{isEnabled ? "disable" : "enable"}</b> the connection between
+                    <br />
+                    <b>{stream.name}</b> and <b>{dst.name}</b>
+                  </>
+                ),
+                okType: isEnabled ? "danger" : "primary",
+                okText: !isEnabled ? "Enable" : "Disable",
+                cancelText: "Cancel",
+                onOk: async () => {
+                  setLoading(true);
+                  try {
+                    const updatedLink = {
+                      ...link,
+                      data: {
+                        ...link.data,
+                        disabled: isEnabled,
+                      },
+                    };
+                    await onSaveMutation.mutateAsync(updatedLink);
+                    await reloadStore();
+                    feedbackSuccess(`Connection ${!isEnabled ? "enabled" : "disabled"}`);
+                    reloadCallback();
+                  } catch (e) {
+                    feedbackError(`Failed to ${!isEnabled ? "enable" : "disable"} connection`, { error: e });
+                  } finally {
+                    setLoading(false);
+                  }
+                },
+              });
+            },
+            requiredPermission: "editEntities",
+          },
+          {
+            icon: <Edit3 className={"w-4 h-4"} />,
+            label: "Edit",
+            href: `/connections/edit?id=${link.id}`,
+            requiredPermission: "editEntities",
+          },
+          {
+            icon: <Activity className="w-4 h-4" />,
+            //collapsed: true,
+            href: toURL("/data", {
+              query: JSON5.stringify({
+                activeView: type,
+                viewState: { [type]: { actorId: link.id } },
+              }),
+            }),
+            label: "Live Events",
+          },
+          {
+            icon: <FaTrash />,
+            collapsed: true,
+            onClick: async () => {
+              deleteConnection(link);
+            },
+            danger: true,
+            label: "Delete",
+            requiredPermission: "deleteEntities",
+          },
+        ];
+        return <ButtonGroup items={items} />;
+      },
+    },
+  ];
+  return (
+    <div>
+      <Table
+        rowKey={"id"}
+        dataSource={validLinks}
+        sortDirections={["ascend", "descend"]}
+        columns={columns}
+        rowClassName={link => {
+          return link.data?.disabled ? "opacity-50" : "";
+        }}
+        className="border border-backgroundDark rounded-lg "
+        pagination={false}
+        loading={loading}
+        onChange={onChange}
+      />
+    </div>
+  );
+}
+
+function Connections(props: RemoteEntitiesProps) {
+  const { streams, destinations, links, functions } = props;
+  const router = useRouter();
+  const destinationFilter = router.query.destination as string | undefined;
+  const srcFilter = router.query.source as string | undefined;
+  const workspace = useWorkspace();
+  const [searchQuery, setSearchQuery] = useQueryStringState("search", { defaultValue: "", skipHistory: true });
+  if (props.streams.length == 0 || props.destinations.length == 0) {
+    return (
+      <div className="flex flex-col justify-center items-center ">
+        <Inbox className="w-16 h-16 text-textDisabled" />
+        <div className="text-center mt-12 text text-textLight max-w-4xl">
+          In order to connect site to destination please create at least one destination and one stream. Currently, you
+          have{" "}
+          <Link href={`/${workspace.slugOrId}/destinations`} className="underline">
+            {props.destinations.length} destination{props.destinations.length === 1 ? "" : "s"}
+          </Link>{" "}
+          and{" "}
+          <Link href={`/${workspace.slugOrId}/streams`} className="underline">
+            {props.streams.length} site{props.streams.length === 1 ? "" : "s"}
+          </Link>{" "}
+          configured
+        </div>
+        <div className="flex space-x-4 items-center mt-4">
+          <WJitsuButton href={"/destinations"} type="default" icon={<PlusOutlined />} requiredPermission="editEntities">
+            Create Destination
+          </WJitsuButton>
+          <WJitsuButton href={"/streams"} type="default" icon={<PlusOutlined />} requiredPermission="editEntities">
+            Create Site
+          </WJitsuButton>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className="flex justify-between pb-6">
+        <div className="flex items-center gap-6">
+          <div className="text-3xl">Edit connections</div>
+          <Input
+            placeholder="Filter by ID or name..."
+            prefix={<Search className="w-3.5 h-3.5 text-textDisabled" />}
+            allowClear
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            className="w-96 mt-0.5"
+            size="small"
+          />
+          {destinationFilter && (
+            <div className="mt-1 ml-4 rounded-full bg-textDisabled/50 px-4 py-1 flex flex-nowrap items-center">
+              {/*<span className="mr-2 ">to</span>*/}
+              <DestinationTitle size="small" destination={destinations.find(d => d.id === destinationFilter)} />
+              <Link className={"ml-1"} prefetch={false} href={toURL(router.route, omit(router.query, ["destination"]))}>
+                <XCircle className="w-4 h-4 text-textLight" />
+              </Link>
+            </div>
+          )}
+          {srcFilter && (
+            <div className="mt-1 ml-4 rounded-full bg-textDisabled/50 px-4 py-1 flex flex-nowrap items-center">
+              {/*<span className="mr-2 ">to</span>*/}
+              <StreamTitle size="small" stream={streams.find(d => d.id === srcFilter)} />
+              <Link className={"ml-1"} prefetch={false} href={toURL(router.route, omit(router.query, ["source"]))}>
+                <XCircle className="w-4 h-4 text-textLight" />
+              </Link>
+            </div>
+          )}
+        </div>
+        <div>
+          <WJitsuButton
+            href={`/connections/edit`}
+            type="primary"
+            size="large"
+            icon={<FaPlus className="anticon" />}
+            requiredPermission="editEntities"
+          >
+            Connect site and destination
+          </WJitsuButton>
+        </div>
+      </div>
+      <div>
+        {links.length === 0 && <EmptyLinks />}
+        {links.length > 0 && (
+          <ConnectionsTable
+            links={links
+              .filter(l => !destinationFilter || l.toId === destinationFilter)
+              .filter(l => !srcFilter || l.fromId === srcFilter)
+              .filter(l => {
+                if (!searchQuery) return true;
+                const q = searchQuery.trim().toLowerCase();
+                const stream = streams.find(s => s.id === l.fromId);
+                const destination = destinations.find(d => d.id === l.toId);
+                return (
+                  l.id.toLowerCase().includes(q) ||
+                  l.fromId.toLowerCase().includes(q) ||
+                  l.toId.toLowerCase().includes(q) ||
+                  (stream?.name || "").toLowerCase().includes(q) ||
+                  (destination?.name || "").toLowerCase().includes(q)
+                );
+              })}
+            functions={functions}
+            streams={streams}
+            destinations={destinations}
+            reloadCallback={props.reloadCallback}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConnectionsLoader(props: { reloadCallback: () => void }) {
+  const functions = useConfigObjectList("function");
+  const streams = useConfigObjectList("stream");
+  const destinations = useConfigObjectList("destination");
+  const links = useConfigObjectLinks();
+
+  return (
+    <Connections
+      functions={functions}
+      streams={streams}
+      destinations={destinations}
+      links={links.filter(l => l.type === "push")}
+      reloadCallback={() => {}}
+    />
+  );
+}
+
+const ConnectionsPage = () => {
+  const [refresh, setRefresh] = useState(new Date());
+  return (
+    <WorkspacePageLayout>
+      <ConnectionsLoader
+        key={refresh.toISOString()}
+        reloadCallback={() => {
+          setRefresh(new Date());
+        }}
+      />
+    </WorkspacePageLayout>
+  );
+};
+export default ConnectionsPage;

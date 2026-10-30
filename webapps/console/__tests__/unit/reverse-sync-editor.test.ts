@@ -1,0 +1,412 @@
+// @vitest-environment jsdom
+import React from "react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { SyncEditor } from "../../components/ReverseETL/SyncEditor";
+import { ReverseSyncView } from "../../lib/reverse-etl";
+import { reverseStreamEditors } from "../../components/ReverseETL/streams";
+
+const state = vi.hoisted(() => ({
+  rpc: vi.fn(),
+  route: { query: { id: "new" } as Record<string, string>, push: vi.fn(), replace: vi.fn() },
+  destinations: [{ id: "google", destinationType: "google-ads" }],
+  models: [] as { id: string; name: string; warehouseId: string; query: string }[],
+  appConfig: {} as { reverseMappingSuggestionsEnabled?: boolean },
+}));
+vi.mock("juava", async original => ({ ...(await original<typeof import("juava")>()), rpc: state.rpc }));
+vi.mock("next/router", () => ({ useRouter: () => state.route }));
+vi.mock("../../lib/context", () => ({
+  useWorkspace: () => ({ id: "ws", slugOrId: "ws", featuresEnabled: ["reverse-etl"] }),
+  useWorkspaceRole: () => ({ editEntities: true, deleteEntities: true }),
+  useAppConfig: () => state.appConfig,
+}));
+vi.mock("../../lib/ui", () => ({ useUnsavedChanges() {}, confirmOp: vi.fn() }));
+vi.mock("../../lib/store", () => ({
+  useConfigObjectList: (type: string) => (type === "model" ? state.models : state.destinations),
+}));
+vi.mock("../../components/Selectors/DestinationSelector", () => ({ DestinationSelector: () => null }));
+vi.mock("../../components/BackButton/BackButton", () => ({ BackButton: () => null }));
+vi.mock("../../components/EditorToolbar/EditorToolbar", () => ({ EditorToolbar: () => null }));
+vi.mock("../../components/FieldListEditorLayout/FieldListEditorLayout", () => ({
+  default: ({ items }: any) =>
+    React.createElement(
+      React.Fragment,
+      null,
+      ...items.map((item: any) =>
+        React.createElement("div", { key: item.name ?? item.key, "data-testid": item.name }, item.component)
+      )
+    ),
+}));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  state.models = [];
+  state.appConfig = {};
+  state.destinations = [{ id: "google", destinationType: "google-ads" }];
+  state.route.query = { id: "new" };
+  state.route.replace.mockImplementation(async ({ query }: any) => {
+    state.route.query = query;
+  });
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn(() => ({ matches: false, addListener() {}, removeListener() {} }))
+  );
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+  );
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+function mount(sync?: ReverseSyncView) {
+  return render(
+    React.createElement(
+      QueryClientProvider,
+      { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
+      React.createElement(SyncEditor, { sync, reload: async () => {} })
+    )
+  );
+}
+
+function mountNewReady() {
+  state.route.query = { ...state.route.query, modelId: "model1", destinationId: "google" };
+  const stream = reverseStreamEditors["google-ads"].find(s => s.id === "audience")!;
+  const { mode, mapping, streamOptions, checkpointEvery } = savedSync().options;
+  vi.spyOn(stream, "defaults").mockReturnValue({ mode, mapping, streamOptions, checkpointEvery });
+  const result = mount();
+  fireEvent.mouseDown(within(screen.getByTestId("Stream")).getByRole("combobox"));
+  fireEvent.click(screen.getByTitle("Audience"));
+  return result;
+}
+
+it("reuses the URL save key after an uncertain create and page reload", async () => {
+  state.rpc.mockRejectedValue(new Error("Response lost"));
+  const first = mountNewReady();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.rpc).toHaveBeenCalledTimes(1));
+  const key = state.rpc.mock.calls[0][1].body.requestId;
+  expect(state.rpc.mock.calls[0][1].body.sync.data.name).toBeUndefined();
+  expect(state.route.query.requestId).toBe(key);
+  first.unmount();
+  mountNewReady();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.rpc).toHaveBeenCalledTimes(2));
+  expect(state.rpc.mock.calls[1][1].body.requestId).toBe(key);
+});
+
+it("disables fields while Save is pending", async () => {
+  let finish!: (value: unknown) => void;
+  state.rpc.mockImplementation(
+    () =>
+      new Promise(resolve => {
+        finish = resolve;
+      })
+  );
+  mountNewReady();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.rpc).toHaveBeenCalledTimes(1));
+  expect(screen.queryByTestId("Name")).toBeNull();
+  expect(screen.getByTestId("Model").querySelector("input")?.disabled).toBe(true);
+  finish({ id: "saved" });
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+});
+
+it("creates a sync and returns to the list without starting a run", async () => {
+  state.rpc.mockResolvedValue({ id: "saved" });
+  mountNewReady();
+  expect(screen.queryByRole("checkbox", { name: "Run sync after save" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc).toHaveBeenCalledWith("/api/ws/reverse-etl/syncs", expect.objectContaining({ method: "POST" }));
+});
+
+it("shows frontend validation below the buttons and blocks saving an empty form", async () => {
+  mount();
+  const save = screen.getByRole("button", { name: "Save" });
+  fireEvent.click(save);
+  const errors = screen.getByTestId("reverse-sync-save-error");
+  await waitFor(() => expect(errors.textContent).toContain("Choose a model."));
+  expect(errors.textContent).toContain("Choose a destination.");
+  expect(errors.textContent).toContain("Choose a stream.");
+  expect(save.compareDocumentPosition(errors) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(state.rpc).not.toHaveBeenCalled();
+});
+
+it("highlights missing required controls and alternative groups, then saves after correction", async () => {
+  const sync = savedSync();
+  sync.options.mapping = {};
+  sync.options.streamOptions.customerMatchTermsAccepted = false;
+  state.models = [{ id: "model1", name: "Model", warehouseId: "wh", query: "select email" }];
+  state.rpc.mockImplementation(async (url: string) =>
+    url.endsWith("/models/columns") ? { columns: [{ name: "email", type: "text" }] } : { id: "saved" }
+  );
+  mount(sync);
+  await waitFor(() => expect(state.rpc).toHaveBeenCalledTimes(1));
+  await act(async () => {});
+  state.rpc.mockClear();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.getByTestId("reverse-sync-save-error").textContent).toContain("Customer matching"));
+  expect(screen.getByTestId("Customer Match terms").querySelector('[aria-invalid="true"]')).not.toBeNull();
+  expect(screen.getByText("Configure at least one complete option in this group.")).toBeTruthy();
+  expect(state.rpc).not.toHaveBeenCalled();
+  fireEvent.click(within(screen.getByTestId("Customer Match terms")).getByRole("checkbox"));
+  // Restore an existing mapping through a known source-column choice.
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "email column" }));
+  fireEvent.click(screen.getAllByText("email").at(-1)!);
+  expect(screen.getByTestId("Customer Match terms").querySelector('[aria-invalid="true"]')).toBeNull();
+  expect(screen.queryByText("Configure at least one complete option in this group.")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+});
+
+it("shows backend errors below Save and keeps the form open", async () => {
+  state.rpc.mockRejectedValue(new Error("Invalid cron schedule or IANA timezone"));
+  mount(savedSync());
+  const save = screen.getByRole("button", { name: "Save" });
+  fireEvent.click(save);
+  const errors = screen.getByTestId("reverse-sync-save-error");
+  await waitFor(() => expect(errors.textContent).toContain("Invalid cron schedule"));
+  expect(save.compareDocumentPosition(errors) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(state.route.push).not.toHaveBeenCalled();
+});
+
+function savedSync() {
+  return ReverseSyncView.parse({
+    id: "saved",
+    fromId: "model1",
+    toId: "google",
+    modelName: "Model",
+    destinationName: "Google",
+    options: {
+      name: "Audience",
+      stream: "audience",
+      mode: "upsert",
+      mapping: { email: "old_email" },
+      streamOptions: { audience: { kind: "existing", audienceId: "123" }, customerMatchTermsAccepted: true },
+    },
+    settingsLocked: false,
+    latestTask: null,
+    phase: null,
+  });
+}
+it.each([undefined, false, true])("shows mapping suggestions only when configured (%s)", async enabled => {
+  state.appConfig = { reverseMappingSuggestionsEnabled: enabled };
+  mount(savedSync());
+  const button = screen.queryByRole("button", { name: "Suggest mappings" });
+  if (enabled) expect(button).not.toBeNull();
+  else expect(button).toBeNull();
+  expect(state.rpc).not.toHaveBeenCalled();
+});
+it("returns to the list after editing a saved sync", async () => {
+  state.rpc.mockResolvedValue({ id: "saved" });
+  mount(savedSync());
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc).toHaveBeenCalledWith(
+    expect.stringContaining("syncId=saved"),
+    expect.objectContaining({ method: "PUT" })
+  );
+});
+it("still starts a saved sync explicitly with Run now", async () => {
+  state.rpc.mockResolvedValue({ taskId: "task" });
+  mount(savedSync());
+  fireEvent.click(screen.getByRole("button", { name: "Run now" }));
+  await waitFor(() =>
+    expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs/logs?syncId=saved&taskId=task&starting=1")
+  );
+  expect(state.rpc).toHaveBeenCalledWith("/api/ws/reverse-etl/sync", {
+    method: "POST",
+    query: { syncId: "saved" },
+    body: { action: "run" },
+  });
+});
+it("keeps saved mappings visible when column discovery fails", async () => {
+  state.models = [{ id: "model1", name: "Model", warehouseId: "wh", query: "select email" }];
+  state.rpc.mockRejectedValue(new Error("Warehouse unavailable"));
+  mount(savedSync());
+  await screen.findByText("Could not load model columns. Existing mappings are kept.");
+  expect(screen.getByTestId("Email column").textContent).toContain("old_email");
+  expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
+});
+it("keeps a Google sync's own column mapping when the model changes (only the webhook derives its mapping)", async () => {
+  state.models = [
+    { id: "model1", name: "First model", warehouseId: "wh", query: "select email" },
+    { id: "model2", name: "Second model", warehouseId: "wh", query: "select contact" },
+  ];
+  state.rpc.mockImplementation(async (url: string, args: any) =>
+    url.endsWith("/models/columns")
+      ? {
+          columns:
+            args.query.modelId === "model1"
+              ? [{ name: "old_email", type: "text" }]
+              : [{ name: "contact", type: "text" }],
+        }
+      : { id: "saved" }
+  );
+  mount(savedSync());
+  await waitFor(() =>
+    expect(state.rpc).toHaveBeenCalledWith(
+      "/api/ws/models/columns",
+      expect.objectContaining({ query: { modelId: "model1" } })
+    )
+  );
+  fireEvent.mouseDown(within(screen.getByTestId("Model")).getByRole("combobox"));
+  fireEvent.click(screen.getByTitle("Second model"));
+  await waitFor(() =>
+    expect(state.rpc).toHaveBeenCalledWith(
+      "/api/ws/models/columns",
+      expect.objectContaining({ query: { modelId: "model2" } })
+    )
+  );
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.rpc.mock.calls.some(([, args]) => args?.method === "PUT")).toBe(true));
+  const put = state.rpc.mock.calls.find(([, args]) => args?.method === "PUT")![1].body;
+  expect(put.data.mapping).toEqual({ email: "old_email" });
+});
+it("loads model columns for identifiers and consent and refreshes on model selection", async () => {
+  state.models = [
+    { id: "model1", name: "First model", warehouseId: "wh", query: "select email" },
+    { id: "model2", name: "Second model", warehouseId: "wh", query: "select contact" },
+  ];
+  state.rpc.mockImplementation(async (_url: string, args: any) => ({
+    columns:
+      args.query.modelId === "model1"
+        ? [
+            { name: "email_address", type: "text" },
+            { name: "consent", type: "text" },
+          ]
+        : [{ name: "contact", type: "text" }],
+  }));
+  mount(savedSync());
+  await waitFor(() =>
+    expect(state.rpc).toHaveBeenCalledWith(
+      "/api/ws/models/columns",
+      expect.objectContaining({ query: { modelId: "model1" } })
+    )
+  );
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "email column" }));
+  await waitFor(() => expect(screen.getAllByTitle("text")).toHaveLength(2));
+  fireEvent.click(screen.getAllByText("email_address").at(-1)!);
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Ad user data consent column" }));
+  expect(screen.getAllByText("consent").length).toBeGreaterThan(0);
+  fireEvent.click(screen.getAllByText("consent").at(-1)!);
+  fireEvent.mouseDown(within(screen.getByTestId("Model")).getByRole("combobox"));
+  fireEvent.click(screen.getByTitle("Second model"));
+  await waitFor(() =>
+    expect(state.rpc).toHaveBeenCalledWith(
+      "/api/ws/models/columns",
+      expect.objectContaining({ query: { modelId: "model2" } })
+    )
+  );
+  const email = screen.getByRole("combobox", { name: "email column" });
+  fireEvent.focus(email);
+  fireEvent.keyDown(email, { key: "ArrowDown", code: "ArrowDown", keyCode: 40 });
+  await waitFor(() => expect(screen.getAllByText("contact").length).toBeGreaterThan(0));
+  // Existing mapping is not silently cleared by the model switch.
+  expect(screen.getAllByText("email_address").length).toBeGreaterThan(0);
+});
+
+function metaSync(locked = false) {
+  const sync = savedSync();
+  return {
+    ...sync,
+    toId: "meta",
+    settingsLocked: locked,
+    options: {
+      ...sync.options,
+      stream: "conversions",
+      mapping: { ...sync.options.mapping, eventName: "event", eventSourceUrl: "url", clientUserAgent: "agent" },
+      streamOptions: { pixelId: "789", actionSource: "website" },
+    },
+  } as ReverseSyncView;
+}
+it("checks a Meta target before saving, and failed checks prevent saving", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockRejectedValue(new Error("This is a Meta App ID, not a Pixel / Dataset ID"));
+  mount(metaSync());
+  fireEvent.change(within(screen.getByTestId("Pixel / dataset ID")).getByRole("textbox"), { target: { value: "790" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText("This is a Meta App ID, not a Pixel / Dataset ID");
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc.mock.calls[0]).toEqual([
+    "/api/ws/reverse-etl/meta-check",
+    expect.objectContaining({
+      method: "POST",
+      body: {
+        destinationId: "meta",
+        stream: "conversions",
+        streamOptions: { pixelId: "790", actionSource: "website" },
+      },
+    }),
+  ]);
+  expect(state.route.push).not.toHaveBeenCalled();
+});
+it("saves Meta settings after a successful check without starting a run", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockResolvedValue({ name: "Pixel", message: "Read access verified", id: "saved" });
+  mount(metaSync());
+  fireEvent.change(within(screen.getByTestId("Pixel / dataset ID")).getByRole("textbox"), { target: { value: "790" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc.mock.calls.map(([url]) => url)).toEqual([
+    "/api/ws/reverse-etl/meta-check",
+    expect.stringContaining("syncId=saved"),
+  ]);
+});
+it("keeps locked Meta scheduling edits independent of provider availability", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockResolvedValue({ id: "saved" });
+  mount(metaSync(true));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc.mock.calls[0][0]).toContain("syncId=saved");
+});
+
+it("pauses an unlocked active Meta sync without checking an unavailable provider", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockImplementation(async (url: string) => {
+    if (url.endsWith("/meta-check")) throw new Error("Meta unavailable");
+    return { id: "saved" };
+  });
+  mount(metaSync());
+  fireEvent.click(screen.getByRole("switch"));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc.mock.calls[0][1].body.data.disabled).toBe(true);
+});
+it("saves unlocked Meta schedule-only changes without a provider check", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockResolvedValue({ id: "saved" });
+  mount(metaSync());
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Schedule frequency" }));
+  fireEvent.click(screen.getByText("Every hour"));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(state.route.push).toHaveBeenCalledWith("/ws/reverse-syncs"));
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc.mock.calls[0][1].body.data.schedule).toBe("0 * * * *");
+});
+it("checks Meta when re-enabling an unlocked sync even if target settings are unchanged", async () => {
+  state.destinations = [{ id: "meta", destinationType: "facebook-conversions" }];
+  state.rpc.mockRejectedValue(new Error("Meta unavailable"));
+  const sync = metaSync();
+  sync.options.disabled = true;
+  mount(sync);
+  fireEvent.click(screen.getByRole("switch"));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText("Meta unavailable");
+  expect(state.rpc).toHaveBeenCalledTimes(1);
+  expect(state.rpc.mock.calls[0][0]).toBe("/api/ws/reverse-etl/meta-check");
+});

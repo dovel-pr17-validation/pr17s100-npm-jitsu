@@ -1,0 +1,32 @@
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [newjitsu]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review (leave blank to review a commit)
+        required: false
+      commit_sha:
+        description: Commit SHA to review (leave blank when using PR number)
+        required: false
+
+jobs:
+  ai-review:
+    # Bot-opened PRs (e.g. the automated security-fix PRs from github-actions[bot])
+    # are reviewed too: the reusable workflow passes allow-bots: true to codex-action,
+    # so its write-access check no longer aborts on the bot actor. Draft PRs are
+    # skipped inside the reusable workflow.
+    uses: jitsucom/github-workflows/.github/workflows/ai-review.yml@1.46.20261016
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_CODE_REVIEW_APP_ID: ${{ secrets.AI_CODE_REVIEW_APP_ID }}
+      AI_CODE_REVIEW_PRIVATE_KEY: ${{ secrets.AI_CODE_REVIEW_PRIVATE_KEY }}
+    with:
+      review_model: gpt-6.1-sol
+      review_effort: high
+      pr_number: ${{ inputs.pr_number }}
+      commit_sha: ${{ inputs.commit_sha }}

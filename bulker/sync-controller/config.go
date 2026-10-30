@@ -1,0 +1,131 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/jitsucom/bulker/eventslog"
+	"github.com/jitsucom/bulker/jitsubase/appbase"
+	"github.com/jitsucom/bulker/jitsubase/utils"
+	"github.com/spf13/viper"
+)
+
+type Config struct {
+	appbase.Config `mapstructure:",squash"`
+	// # EVENTS LOG CONFIG - settings for events log
+	eventslog.EventsLogConfig `mapstructure:",squash"`
+
+	DatabaseURL string `mapstructure:"DATABASE_URL"`
+	// in case of different visibility of database side car may require different db hostname
+	SidecarDatabaseURL string `mapstructure:"SIDECAR_DATABASE_URL"`
+
+	// # Kubernetes
+
+	// KubernetesNamespace namespace of bulker app. Default: `default`
+	KubernetesNamespace    string `mapstructure:"KUBERNETES_NAMESPACE" default:"default"`
+	KubernetesClientConfig string `mapstructure:"KUBERNETES_CLIENT_CONFIG" default:"local"`
+	KubernetesContext      string `mapstructure:"KUBERNETES_CONTEXT"`
+	// nodeSelector for sync pods in json format, e.g: {"disktype": "ssd"}
+	KubernetesNodeSelector string `mapstructure:"KUBERNETES_NODE_SELECTOR"`
+
+	ContainerStatusCheckSeconds   int `mapstructure:"CONTAINER_STATUS_CHECK_SECONDS" default:"10"`
+	ContainerGraceShutdownSeconds int `mapstructure:"CONTAINER_GRACE_SHUTDOWN_SECONDS" default:"60"`
+	ContainerInitTimeoutSeconds   int `mapstructure:"CONTAINER_INIT_TIMEOUT_SECONDS" default:"180"`
+
+	TaskTimeoutHours int `mapstructure:"TASK_TIMEOUT_HOURS" default:"48"`
+
+	SidecarImage       string `mapstructure:"SIDECAR_IMAGE" default:"jitsucom/sidecar:latest"`
+	ReverseEnabled     bool   `mapstructure:"REVERSE_ENABLED" default:"false"`
+	ReverseRunnerImage string `mapstructure:"REVERSE_RUNNER_IMAGE" default:"jitsucom/retl-runner:latest"`
+	// Pre-provisioned runtime-only Secret: RETL_DATABASE_URL, RETL_CONSOLE_URL,
+	// RETL_CONSOLE_TOKEN, RETL_OBJECT_STORE and RETL_OBJECT_BUCKET. Never use schema-owner credentials.
+	ReverseRuntimeSecret string `mapstructure:"REVERSE_RUNTIME_SECRET"`
+	// Optional additional trusted CA bundle (ca.crt) for runner HTTPS and sync admission.
+	ExtraCAConfigMap   string `mapstructure:"EXTRA_CA_CONFIG_MAP"`
+	PodsServiceAccount string `mapstructure:"PODS_SERVICE_ACCOUNT"`
+	// Separate identity for bucket access; falls back to PodsServiceAccount outside Helm.
+	ReverseServiceAccount string `mapstructure:"REVERSE_SERVICE_ACCOUNT"`
+	// JSON requests/limits for cpu, memory and ephemeral-storage; omitted entries use defaults.
+	ReverseRunnerResources  string `mapstructure:"REVERSE_RUNNER_RESOURCES"`
+	ReverseScratchSizeLimit string `mapstructure:"REVERSE_SCRATCH_SIZE_LIMIT"`
+	reversePodSettings      *reversePodSettings
+
+	// CronTemplateRevision, when non-zero, overrides the built-in
+	// cronTemplateRevision constant used in the CronJob drift hash. Lets ops
+	// force a one-shot re-patch of every managed CronJob at runtime — without a
+	// code change + image rebuild — by setting/bumping
+	// SYNCCTL_CRON_TEMPLATE_REVISION. 0 (unset) keeps the compiled-in constant.
+	CronTemplateRevision int `mapstructure:"CRON_TEMPLATE_REVISION" default:"0"`
+
+	LocalIngestEndpoint  string `mapstructure:"LOCAL_INGEST_ENDPOINT"`
+	GlobalIngestEndpoint string `mapstructure:"GLOBAL_INGEST_ENDPOINT"`
+
+	ConsoleURL   string `mapstructure:"CONSOLE_URL"`
+	ConsoleToken string `mapstructure:"CONSOLE_TOKEN"`
+
+	// # Repository (syncs export polling)
+	// RepositoryBaseURL is the URL of the console export endpoints, e.g.
+	// "http://console:3000/api/admin/export". The "/syncs" path is appended.
+	// If empty, the syncs repository is disabled — syncctl runs in legacy
+	// reactive-only mode and won't manage CronJobs.
+	RepositoryBaseURL          string `mapstructure:"REPOSITORY_BASE_URL"`
+	RepositoryAuthToken        string `mapstructure:"REPOSITORY_AUTH_TOKEN"`
+	RepositoryRefreshPeriodSec int    `mapstructure:"REPOSITORY_REFRESH_PERIOD_SEC" default:"30"`
+	RepositoryCacheDir         string `mapstructure:"REPOSITORY_CACHE_DIR" default:"/tmp/syncctl-cache"`
+
+	// # CronJob defaults (per autonomous sync run)
+	// JobActiveDeadlineSeconds caps the total time a Job (Pending+Running)
+	// can take before kubelet kills it. Doubles as the max-wait-for-resources
+	// timeout: a Pod that can't schedule within this window is killed and the
+	// Job is marked Failed. With JobBackoffLimit=0 the Job is not retried;
+	// the next CronJob fire happens normally on the next schedule tick.
+	JobActiveDeadlineSeconds int32 `mapstructure:"JOB_ACTIVE_DEADLINE_SECONDS" default:"180000"`
+	JobBackoffLimit          int32 `mapstructure:"JOB_BACKOFF_LIMIT" default:"0"`
+
+	// JitterMaxSeconds caps the deterministic sub-minute sleep at the start
+	// of the autonomous sync admission init. Set to 0 to disable jitter
+	// (all syncs sharing the same schedule fire at the same instant).
+	// Value is passed through to the admission init via JITTER_MAX_SECONDS
+	// env so it's visible in the rendered Pod spec.
+	JitterMaxSeconds int32 `mapstructure:"JITTER_MAX_SECONDS" default:"60"`
+
+	// # source_task retention (hourly sweep in task_manager)
+	// Replace the previous console-side env knobs (SYNC_TASK_LOG_SIZE /
+	// SYNC_TASK_LOG_AGE in webapps/console/lib/server/serverEnv.ts) since
+	// the autonomous CronJob path no longer routes through the console
+	// endpoint that used to drive retention.
+	TaskLogKeepPerSync int   `mapstructure:"SYNC_TASK_LOG_SIZE" default:"3000"`
+	TaskLogMaxAgeDays  int32 `mapstructure:"SYNC_TASK_LOG_AGE" default:"60"`
+
+	// # Nango (OAuth refresh in autonomous sync Pods)
+	// The oauth-refresh init container needs these to fetch fresh tokens
+	// from Nango at run time. When unset, OAuth-using syncs proceed with
+	// whatever tokens were embedded in the per-CronJob Secret at the last
+	// syncs export poll — the init container logs a warning and falls
+	// through. Tokens may be stale by the time the CronJob fires.
+	NangoAPIHost            string `mapstructure:"NANGO_API_HOST"`
+	NangoSecretKey          string `mapstructure:"NANGO_SECRET_KEY"`
+	GoogleAdsDeveloperToken string `mapstructure:"GOOGLE_ADS_DEVELOPER_TOKEN"`
+
+	LogLevel   string `mapstructure:"LOG_LEVEL" default:"INFO"`
+	DBLogLevel string `mapstructure:"DB_LOG_LEVEL" default:"INFO"`
+}
+
+func init() {
+	viper.SetDefault("HTTP_PORT", utils.NvlString(os.Getenv("PORT"), "3043"))
+}
+
+func (c *Config) PostInit(settings *appbase.AppSettings) error {
+	if c.ReverseEnabled && (c.RepositoryBaseURL == "" || c.ReverseRuntimeSecret == "" || c.reverseServiceAccount() == "") {
+		return fmt.Errorf("reverse runs require repository, runtime Secret and pod service account")
+	}
+	if c.ReverseEnabled {
+		if err := c.initReversePodSettings(); err != nil {
+			return err
+		}
+	}
+	if c.KubernetesClientConfig == "" {
+		return fmt.Errorf("KUBERNETES_CLIENT_CONFIG is required")
+	}
+	return c.Config.PostInit(settings)
+}

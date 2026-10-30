@@ -1,0 +1,135 @@
+{{- if gt (int .Values.scaling.ingest.replicas) 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: ingest
+spec:
+  replicas: {{ .Values.scaling.ingest.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingest
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingest
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      initContainers:
+        - name: build
+          image: golang:1.26-bookworm
+          workingDir: /src/ingest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Copying source..."
+              cp -r /project/bulker/* /src/
+              echo "Waiting for build lock (Go builds are serialized to avoid overloading the node)..."
+              flock /go-cache/build.lock \
+                go build -buildvcs=false -o /build/ingest .
+              echo "Build complete"
+          volumeMounts:
+            - name: project
+              mountPath: /project
+              readOnly: true
+            - name: build
+              mountPath: /build
+            - name: go-cache
+              mountPath: /go-cache
+            - name: src
+              mountPath: /src
+          env:
+            - name: GOCACHE
+              value: /go-cache/build
+            - name: GOMODCACHE
+              value: /go-cache/mod
+          # Cap the build so a compile can't starve the kubelet or running
+          # pods. Builds are additionally serialized via the flock above, so
+          # at most one build is active — and it reuses the shared GOCACHE
+          # warmed by whichever build ran first. Go 1.26 is container-aware:
+          # GOMAXPROCS follows the cgroup CPU limit automatically.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "3"
+              memory: 3Gi
+      containers:
+        - name: ingest
+          image: debian:bookworm-slim
+          command: ["/build/ingest"]
+          ports:
+            - name: http
+              containerPort: 3049
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: jitsu-secrets
+            # Connection URLs of the in-cluster dependencies (helm-deps chart).
+            # Listed after jitsu-secrets so its keys win over any legacy URL
+            # keys there; explicit env entries below still take precedence.
+            - secretRef:
+                name: jitsu-deps-urls
+                optional: true
+          env:
+            {{- include "jitsu-dev.env" (dict "ctx" . "service" "ingest"
+                  "extra" (dict "HTTP_PORT" "3049")) | nindent 12 }}
+          volumeMounts:
+            - name: build
+              mountPath: /build
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: project
+          hostPath:
+            path: {{ include "jitsu-dev.projectRoot" . }}
+            type: Directory
+        - name: build
+          emptyDir: {}
+        - name: src
+          emptyDir: {}
+        - name: go-cache
+          persistentVolumeClaim:
+            claimName: go-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: ingest
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 3049
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: ingest
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

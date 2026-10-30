@@ -1,0 +1,242 @@
+import { db } from "./db";
+import { getLog, randomId } from "juava";
+import { AnalyticsInterface, emptyAnalytics, jitsuAnalytics } from "@jitsu/js";
+import { originFromAuth, RequestOrigin, SessionUser } from "../schema";
+import { Workspace } from "@prisma/client";
+import { NextApiRequest } from "next";
+import { AnalyticsContext } from "@jitsu/protocols/analytics";
+import { getServerEnv } from "./serverEnv";
+
+const serverEnv = getServerEnv();
+
+/**
+ * Server telemetry is enabled by default. We need it to see the usage
+ * of self-hosted instance. It's disabled for Jitsu Cloud.
+ */
+export const anonymousTelemetryEnabled = !serverEnv.JITSU_DISABLE_ANONYMOUS_TELEMETRY;
+export const anonymousTelemetryJitsuKey =
+  serverEnv.JITSU_SERVER_ANONYMOUS_TELEMETRY_KEY || "mxPhV4KmCQasdEsGr98TzX4hq12VuEaN:etEKNhKx5Gy2Ib8gVu4CSWGF6oRgyckG";
+
+/**
+ * Frontend telemetry is opposite from server telemetry. It's disabled by default,
+ * since we need it ONLY for Jitsu Cloud. We don't need to track UI usage of self-hosted instances
+ */
+export const productTelemetryHost = serverEnv.JITSU_PRODUCT_TELEMETRY_HOST; //support old and new env vars
+export const productTelemetryEnabled = !!productTelemetryHost;
+export const productTelemetryBackendKey = serverEnv.JITSU_PRODUCT_BACKEND_TELEMETRY_WRITE_KEY;
+
+const log = getLog("telemetry");
+
+const anonymousTelemetry = anonymousTelemetryEnabled
+  ? jitsuAnalytics({
+      host: "https://ingest.g.jitsu.com",
+      writeKey: anonymousTelemetryJitsuKey,
+      //debug: true,
+    })
+  : emptyAnalytics;
+
+function createAnalytics() {
+  return productTelemetryEnabled
+    ? jitsuAnalytics({
+        host: productTelemetryHost,
+        writeKey: productTelemetryBackendKey,
+        s2s: true,
+        fetchTimeoutMs: 1000,
+        //        debug: true,
+      })
+    : emptyAnalytics;
+}
+
+type WorkspaceProps = { slug?: string; name?: string };
+type WorkspaceIdAndProps = { id: string } & WorkspaceProps;
+
+type TrackEvents =
+  | "user_created"
+  | "workspace_created"
+  | "workspace_onboarded"
+  | "workspace_activated"
+  | "workspace_ping"
+  | "workspace_access"
+  | "workspace_deleted"
+  | "create_object"
+  | "update_object"
+  | "delete_object"
+  | "connection_created"
+  | "connection_deleted"
+  // self-serve backup window changed in the console (JITSU-202); an upsell signal
+  | "backup_retention_changed"
+  | "login"
+  | "logout";
+
+export interface ProductAnalytics extends AnalyticsInterface {
+  identifyUser(sessionUser: TrackedUser): Promise<any>;
+
+  workspace(workspaceId: string, opts?: WorkspaceProps): Promise<any>;
+
+  workspace(workspace: Workspace): Promise<any>;
+
+  /**
+   * Typed version of track method
+   */
+  track(event: TrackEvents, props?: any): Promise<any>;
+}
+
+function createProductAnalytics(
+  analytics: AnalyticsInterface,
+  opts?: { req?: NextApiRequest; workspace?: Workspace | WorkspaceIdAndProps; origin?: RequestOrigin }
+): ProductAnalytics {
+  const req = opts?.req;
+  const ws = opts?.workspace;
+  // Where the request came from (ui / api / cli / mcp). Stamped onto every track
+  // event below so all product-analytics events carry their origin.
+  const origin = opts?.origin;
+  // Injected into every track event so all workspace-scoped events carry the same
+  // workspace identity in their properties (in addition to the `groupId`). Omitted
+  // when the event isn't tied to a workspace (e.g. `user_created`).
+  const workspaceProps = ws
+    ? { workspaceId: ws.id, workspaceName: ws.name ?? undefined, workspaceSlug: ws.slug ?? undefined }
+    : undefined;
+  return {
+    ...analytics,
+    identifyUser(sessionUser: TrackedUser): Promise<void> {
+      return analytics.identify(sessionUser.internalId, {
+        email: sessionUser.email,
+        name: sessionUser.name,
+        // externalId isn't available at every call site (e.g. auth events), so only
+        // send it when known — otherwise we'd blank out the trait set elsewhere.
+        ...(sessionUser.externalId ? { externalId: sessionUser.externalId } : {}),
+      });
+    },
+    workspace(idOrObject: string | Workspace, opts?: WorkspaceProps) {
+      if (typeof idOrObject === "string") {
+        return analytics.group(
+          idOrObject,
+          opts ? { workspaceSlug: opts.slug, workspaceName: opts.name, name: opts.name, workspaceId: idOrObject } : {}
+        );
+      } else {
+        return analytics.group(idOrObject.id, {
+          workspaceSlug: idOrObject.slug,
+          workspaceName: idOrObject.name,
+          workspaceId: idOrObject.id,
+        });
+      }
+    },
+    track(event: TrackEvents, props?: any): Promise<any> {
+      const context: AnalyticsContext = {
+        ip: (req?.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req?.socket?.remoteAddress,
+        //userAgent: req?.headers["user-agent"] as string,
+      };
+      return analytics.track(event, {
+        ...(origin ? { origin } : {}),
+        ...(workspaceProps || {}),
+        ...(props || {}),
+        context,
+      });
+    },
+  };
+}
+
+export type TrackedUser = Pick<SessionUser, "internalId" | "email" | "name"> &
+  Partial<Pick<SessionUser, "externalId" | "loginProvider" | "authType" | "tokenId" | "tokenType">>;
+
+/**
+ * Server-side login/logout product event. Account-level: fires an identify + the event,
+ * with no workspace group and no IP context. Best-effort — never throws into the auth flow.
+ */
+export async function trackAuthEvent(
+  user: Pick<SessionUser, "internalId" | "email" | "name"> & { externalId?: string },
+  event: "login" | "logout",
+  authType: string
+): Promise<void> {
+  try {
+    await withProductAnalytics(p => p.track(event, { authType }), { user: { ...user, loginProvider: authType } });
+  } catch (e) {
+    log.atWarn().withCause(e).log(`Failed to send ${event} product-analytics event`);
+  }
+}
+
+/**
+ * Entry point for all analytics events. The method makes sure that all identify events
+ * are properly sent, and calls a `callback` on configured analytics instance.
+ */
+export function withProductAnalytics(
+  callback: (p: ProductAnalytics) => Promise<any>,
+  opts: {
+    user: TrackedUser;
+    workspace?: Workspace | WorkspaceIdAndProps;
+    req?: NextApiRequest;
+  }
+): Promise<any[]> {
+  //we create new instance every time since analytics.js saves state in props and not thread safe
+  //creating of an instance is cheap operation
+  const instance = createProductAnalytics(createAnalytics(), {
+    req: opts?.req,
+    workspace: opts.workspace,
+    // Derived from the acting user's auth fields; guarantees every event carries an origin.
+    origin: originFromAuth(opts.user),
+  });
+  const allPromises: Promise<any>[] = [];
+  if (opts.user) {
+    allPromises.push(instance.identifyUser(opts.user));
+  }
+  if (opts.workspace) {
+    allPromises.push(
+      instance.workspace(opts.workspace.id, {
+        slug: opts.workspace.slug || undefined,
+        name: opts.workspace.name || undefined,
+      })
+    );
+  }
+  allPromises.push(
+    (async () => {
+      try {
+        return await callback(instance);
+      } catch (e) {
+        log.atWarn().withCause(e).log(`Failed to send product analytics event`);
+      }
+      return {};
+    })()
+  );
+  return Promise.all(allPromises);
+}
+
+let deploymentId: string | undefined = undefined;
+
+export async function initTelemetry(): Promise<{ deploymentId: string } | undefined> {
+  if (anonymousTelemetryEnabled) {
+    if (!deploymentId) {
+      try {
+        const instanceIdVal = await db.prisma().globalProps.findFirst({ where: { name: "deploymentId" } });
+        if (instanceIdVal) {
+          deploymentId = (instanceIdVal.value as any).id;
+          log.atInfo().log(`Deployment id is going to be used for telemetry: ${deploymentId}`);
+        } else {
+          deploymentId = randomId();
+          log.atInfo().log(`Creating new deployment id ${deploymentId}`);
+          await db.prisma().globalProps.create({ data: { name: "deploymentId", value: { id: deploymentId } } });
+          await trackTelemetryEvent("deployment_created");
+        }
+      } catch (e) {
+        log.atWarn().withCause(e).log("Failed to initialize telemetry");
+      }
+    }
+  }
+  return deploymentId ? { deploymentId } : undefined;
+}
+
+export async function trackTelemetryEvent(event: string, props: any = {}): Promise<void> {
+  try {
+    anonymousTelemetry.setAnonymousId(deploymentId || "unknown");
+    const result = await anonymousTelemetry.track(`console.${event}`, {
+      ...props,
+      deploymentId,
+      source: "console",
+      nodeVersion: process.versions.node,
+      host: serverEnv.HOST,
+      onVercel: serverEnv.VERCEL,
+    });
+    log.atDebug().log(`Sent ${event} to telemetry server. Result`, JSON.stringify(result, null, 2));
+  } catch (e) {
+    log.atWarn().withCause(e).log(`Failed to send ${event} to telemetry server`);
+  }
+}

@@ -1,0 +1,463 @@
+name: 🧪Lint and Test
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [newjitsu]
+  workflow_dispatch:
+
+env:
+  # The jitsu-builder container has Playwright browsers binaries preinstalled on this path:
+  PLAYWRIGHT_BROWSERS_PATH: /root/.cache/ms-playwright
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-format:
+    name: ✨ Lint & Test
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      packages: write
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: 🔍 Check changed files
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            playwright:
+              - 'libs/jitsu-js/**'
+              - '**/playwright/**'
+              - '**/*.spec.ts'
+              - '**/playwright.config.ts'
+            nodejs:
+              - 'cli/**'
+              - 'libs/**'
+              - 'services/**'
+              - 'types/**'
+              - 'webapps/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+
+      - name: 🚀 Setup Turbo cache
+        if: steps.changes.outputs.nodejs == 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            .turbo
+            **/node_modules/.cache
+          key: ${{ runner.os }}-turbo-lint-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-lint-
+
+      - name: 🐳 Pull and start builder container
+        if: steps.changes.outputs.nodejs == 'true'
+        # Mount the host Docker socket + share the host network so tests using
+        # testcontainers (rotor) can talk to the runner's Docker daemon and
+        # reach sibling containers on localhost. Ryuk is disabled here for the
+        # same reason the bulker Go test job disables it — the reaper needs
+        # privileged socket access we don't grant, and CI runners are ephemeral.
+        run: |
+          docker pull jitsucom/jitsu-builder:latest
+          docker run -d --name builder \
+            -v ${{ github.workspace }}:/workspace -w /workspace \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --network host \
+            -e CI=true \
+            -e TESTCONTAINERS_RYUK_DISABLED=true \
+            jitsucom/jitsu-builder:latest tail -f /dev/null
+
+      - name: 📦 Fetch dependencies from store
+        if: steps.changes.outputs.nodejs == 'true'
+        run: |
+          docker exec builder sh -c 'echo "pnpm store path: $(pnpm store path)"'
+          docker exec builder pnpm fetch
+
+      - name: 📦 Install dependencies
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm install --frozen-lockfile --offline
+
+      - name: ✨ Check code format
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm format:check:all
+
+      - name: 🔧 Run codegen
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm codegen
+
+      - name: 🧪️ Run Typecheck
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm typecheck
+
+      - name: 🧪 Run linter
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm lint
+
+      - name: 🧪 Run tests
+        if: steps.changes.outputs.nodejs == 'true'
+        run: docker exec builder pnpm test
+
+      - name: 🎭 Run Playwright tests
+        if: steps.changes.outputs.nodejs == 'true' && steps.changes.outputs.playwright == 'true'
+        # Note: build of @jitsu/js and all it's dep is required for playwright tests to work
+        run: |
+          docker exec builder pnpm --filter jsondiffpatch --filter @jitsu/js build
+          docker exec builder pnpm test:playwright
+
+      - name: 🧹 Cleanup container
+        if: always() && steps.changes.outputs.nodejs == 'true'
+        run: docker stop builder && docker rm builder
+
+  bulker-test:
+    # One shard per warehouse. Redshift alone is ~47% of the suite's runtime, so
+    # running the destinations in one job made every change wait on it; split up,
+    # the local-container shard reports back in a couple of minutes and each
+    # cloud warehouse is only as slow as itself.
+    #
+    # `configs` is BULKER_TEST_CONFIGS, which the sql suite applies before it
+    # creates anything — that is what stops a cloud shard from starting (and
+    # waiting ~43s on) the local containers it will never use. A shard that names
+    # a destination it can't configure fails loudly rather than passing green
+    # with zero tests run, so each shard also gets only the secret it needs.
+    name: 🧪 Bulker Test (${{ matrix.shard }})
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # A broken warehouse shouldn't hide the results of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: app
+            packages: >-
+              ./jitsubase/... ./ingest/... ./kafkabase/... ./eventslog/... ./bulkerapp/...
+              ./bulkerlib ./bulkerlib/types/... ./bulkerlib/implementations
+              ./bulkerlib/implementations/api_based/... ./bulkerlib/implementations/file_storage/...
+              ./bulkerlib/implementations/sql/redshift_driver/... ./bulkerlib/implementations/sql/testcontainers/...
+          - shard: local
+            packages: ./bulkerlib/implementations/sql
+            configs: postgres,mysql,clickhouse,clickhouse_cluster,clickhouse_cluster_noshards
+          - shard: bigquery
+            packages: ./bulkerlib/implementations/sql
+            configs: bigquery
+            needs_secrets: true
+          - shard: snowflake
+            packages: ./bulkerlib/implementations/sql
+            configs: snowflake
+            needs_secrets: true
+          - shard: redshift
+            packages: ./bulkerlib/implementations/sql
+            configs: redshift_iam
+            needs_secrets: true
+          - shard: motherduck
+            packages: ./bulkerlib/implementations/sql
+            configs: duckdb
+            needs_secrets: true
+    env:
+      # Isolates this run's warehouse objects from every other run's: the suite
+      # puts itself in a schema (dataset, on BigQuery) named after the run, so
+      # two runs in flight at once stop dropping each other's tables.
+      BULKER_TEST_RUN_ID: ${{ github.run_id }}_${{ github.run_attempt }}
+      BULKER_TEST_CONFIGS: ${{ matrix.configs }}
+      TESTCONTAINERS_RYUK_DISABLED: true
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: 🔍 Check changed files
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            bulker:
+              - 'bulker/jitsubase/**'
+              - 'bulker/ingest/**'
+              - 'bulker/kafkabase/**'
+              - 'bulker/eventslog/**'
+              - 'bulker/bulkerlib/**'
+              - 'bulker/bulkerapp/**'
+
+      - name: 🔍 Check whether this shard can run
+        id: shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          NEEDS_SECRETS: ${{ matrix.needs_secrets }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          # Pull requests from forks get no repository secrets, so a shard that
+          # needs warehouse credentials can only fail there. Skip it — the local
+          # and app shards still cover the change.
+          if [ "$NEEDS_SECRETS" = "true" ] && [ "$EVENT_NAME" = "pull_request" ] && [ "$PR_HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "::notice::Skipping the $SHARD shard: warehouse credentials aren't available to pull requests from forks."
+          else
+            echo "run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Go
+        id: go
+        if: steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+          # Cached by the step below instead: setup-go derives one key from the
+          # go.sum hash, so all six shards would contend for a single entry —
+          # only the first to finish saves ("another job may be creating this
+          # cache"), and the rest then restore a cache built for someone else's
+          # packages. Compiling was ~46% of the app shard's runtime because of it.
+          cache: false
+
+      # Modules are fully determined by go.sum and identical for every shard, so
+      # they share one entry — the contention that breaks the build cache is
+      # harmless here, since whichever shard wins the save stores exactly what
+      # the others would have. The restore-key keeps a dependency bump from
+      # re-downloading the whole module set on all six shards at once — which is
+      # also why the toolchain version is deliberately absent here, unlike in the
+      # build cache below: downloaded modules don't depend on the compiler, so
+      # pinning them to it would throw the fallback away on every Go release.
+      - name: 💾 Restore Go module cache
+        if: steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: bulker-gomod-${{ hashFiles('bulker/**/*.sum') }}
+          restore-keys: |
+            bulker-gomod-
+
+      # Build output differs per shard, so this one needs its own key, and the
+      # run id keeps it fresh: actions/cache skips the save on an exact hit, so
+      # a key made only of go.sum would be written once and then never updated
+      # again — every later run restoring a cache that covers less and less of
+      # what actually changed. restore-keys supplies the warm start; the run id
+      # only decides what gets written back.
+      #
+      # The toolchain version is in both keys because check-latest floats it,
+      # and build entries from an older compiler are dead weight.
+      #
+      # This does write six entries per bulker run, against a 10GB repo budget
+      # shared with the turbo caches. It's bounded by the paths-filter above —
+      # nothing here runs unless the PR touches bulker — but if turbo starts
+      # missing, this is what to look at first.
+      - name: 💾 Restore Go build cache
+        if: steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: bulker-gobuild-${{ matrix.shard }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('bulker/**/*.sum') }}-${{ github.run_id }}
+          restore-keys: |
+            bulker-gobuild-${{ matrix.shard }}-${{ steps.go.outputs.go-version }}-
+
+      - name: 🧪 Run Bulker tests
+        if: steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        working-directory: ./bulker
+        env:
+          # The app shard runs the S3/GCS file storage tests; the destination
+          # shards each get only their own warehouse's credentials.
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          BULKER_TEST_S3: ${{ matrix.shard == 'app' && secrets.BULKER_TEST_S3 || '' }}
+          BULKER_TEST_BIGQUERY: ${{ matrix.shard == 'bigquery' && secrets.BULKER_TEST_BIGQUERY || '' }}
+          BULKER_TEST_SNOWFLAKE: ${{ matrix.shard == 'snowflake' && secrets.BULKER_TEST_SNOWFLAKE || '' }}
+          BULKER_TEST_REDSHIFT_IAM: ${{ matrix.shard == 'redshift' && secrets.BULKER_TEST_REDSHIFT_IAM || '' }}
+          BULKER_TEST_MOTHERDUCK: ${{ matrix.shard == 'motherduck' && secrets.BULKER_TEST_MOTHERDUCK || '' }}
+          # BULKER_TEST_REDSHIFT / BULKER_TEST_REDSHIFT_SERVERLESS have no value
+          # configured, so those destinations have never actually run here. They
+          # get a shard of their own once the secrets exist.
+          BULKER_TEST_MILLION_ROWS_BATCHED: ${{ matrix.shard == 'local' && 'postgres' || '' }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          go test -parallel=10 -timeout 60m -json $PACKAGES > test_report.json
+
+      - name: 🧹 Drop this run's warehouse schemas
+        # always(), so it also fires when the job is cancelled — which, with
+        # cancel-in-progress, is what happens on every re-push. The app and local
+        # shards have nothing to drop: their state lives in throwaway containers.
+        if: always() && matrix.needs_secrets && steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        # A leaked schema is worth seeing in the log, but it isn't a reason to
+        # call a passing test run failed.
+        continue-on-error: true
+        working-directory: ./bulker
+        env:
+          BULKER_TEST_CLEANUP: "true"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          BULKER_TEST_BIGQUERY: ${{ matrix.shard == 'bigquery' && secrets.BULKER_TEST_BIGQUERY || '' }}
+          BULKER_TEST_SNOWFLAKE: ${{ matrix.shard == 'snowflake' && secrets.BULKER_TEST_SNOWFLAKE || '' }}
+          BULKER_TEST_REDSHIFT_IAM: ${{ matrix.shard == 'redshift' && secrets.BULKER_TEST_REDSHIFT_IAM || '' }}
+          BULKER_TEST_MOTHERDUCK: ${{ matrix.shard == 'motherduck' && secrets.BULKER_TEST_MOTHERDUCK || '' }}
+        # -v because this step is continue-on-error: without it a pass prints
+        # nothing and a failure is easy to miss, so the log is the only place a
+        # leaked schema would ever show up.
+        run: go test -count=1 -v -timeout 10m -run TestCleanupTestRun ./bulkerlib/implementations/sql
+
+      - name: 📊 Generate test report
+        if: always() && steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        working-directory: ./bulker
+        run: |
+          go install github.com/vakenbolt/go-test-report@latest
+          cat test_report.json | ~/go/bin/go-test-report
+
+      - name: 📤 Upload test artifacts
+        if: always() && steps.changes.outputs.bulker == 'true' && steps.shard.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bulker-test-report-${{ matrix.shard }}
+          path: |
+            bulker/test_report.html
+            bulker/test_report.json
+
+  bulker-test-result:
+    # The `default-branch-protection` ruleset requires a check called exactly
+    # "🧪 Bulker Test". Sharding renamed that check to "🧪 Bulker Test (app)",
+    # "… (redshift)" and so on, so the required one would never report again and
+    # every PR would sit unmergeable. This job restores it as a single gate over
+    # the whole matrix; the ruleset needs no edit.
+    #
+    # Adding a shard to the matrix therefore does not require touching the
+    # ruleset either — this job keeps covering it.
+    name: 🧪 Bulker Test
+    needs: [bulker-test]
+    # Not the default (which skips when a dependency fails, leaving the required
+    # check pending forever rather than red), and not always() either: with
+    # cancel-in-progress above, every re-push cancels a run, and always() would
+    # publish this required check as failed for it. !cancelled() still fires when
+    # a shard fails, which is the case that has to turn the check red.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔍 Check shard results
+        env:
+          RESULT: ${{ needs.bulker-test.result }}
+        run: |
+          # A matrix job's result is success only when every shard succeeded.
+          # On a PR that touches no bulker code the paths filter skips every
+          # step, but the job itself still reports success — 'skipped' can only
+          # happen if someone later puts a job-level if: on bulker-test, and it
+          # should pass then too. Anything else — failure, cancelled — must not.
+          if [ "$RESULT" = "success" ] || [ "$RESULT" = "skipped" ]; then
+            echo "All bulker test shards passed (result: $RESULT)."
+          else
+            echo "::error::Bulker test shards did not pass (result: $RESULT). See the per-shard jobs for detail."
+            exit 1
+          fi
+
+  notify:
+    name: 📢 Notify
+    needs: [lint-and-format, bulker-test]
+    if: always() && github.ref == 'refs/heads/newjitsu'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      packages: write
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v6
+
+      - name: 📝 Get short SHA
+        id: short-sha
+        run: echo "sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: 🔍 Check job statuses
+        id: status
+        run: |
+          if [[ "${{ needs.lint-and-format.result }}" == "success" && "${{ needs.bulker-test.result }}" == "success" ]]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "color=#36a64f" >> $GITHUB_OUTPUT
+            echo "header=✅ Lint & Test on branch \`${{ github.ref_name }}\` SUCCEEDED" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "color=#ff0000" >> $GITHUB_OUTPUT
+            FAILED_JOBS=""
+            [[ "${{ needs.lint-and-format.result }}" != "success" ]] && FAILED_JOBS="lint-and-format"
+            [[ "${{ needs.bulker-test.result }}" != "success" ]] && FAILED_JOBS="$FAILED_JOBS bulker-test"
+            echo "header=❌ Lint & Test on branch \`${{ github.ref_name }}\` FAILED ($FAILED_JOBS)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 💬 Send notification to Slack
+        uses: ./.github/actions/slack-notify
+        with:
+          slack_webhook_url: ${{ secrets.CI_SLACK_WEBHOOK }}
+          color: ${{ steps.status.outputs.color }}
+          header: ${{ steps.status.outputs.header }}
+          blocks: |
+            - title: Commit
+              value: ${{ steps.short-sha.outputs.sha }}
+              url: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+            - title: Commit message
+              value: ${{ toJSON(github.event.head_commit.message) }}
+              is_code: true
+            - title: Workflow run
+              value: ${{ steps.status.outputs.success == 'true' && 'View workflow run' || 'View failed run' }}
+              url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - title: Triggered by
+              value: ${{ github.actor }}
+
+  dispatch-publish:
+    name: 🚀 Dispatch Publish
+    # Auto-publish only when an explicit version-bump landed on newjitsu and
+    # lint+test passed. Every other commit goes unpublished — use the manual
+    # publish.yml dispatch for canary/beta off-cycle builds.
+    needs: [lint-and-format, bulker-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/newjitsu'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v6
+        with:
+          # Need history covering the entire push range so dorny/paths-filter
+          # (which uses `base: ${{ github.event.before }}` implicitly for push
+          # events) sees every commit in the merge, not just the tip.
+          fetch-depth: 0
+
+      - name: 🔍 Did a version file change anywhere in the push?
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            version_bump:
+              - .services.version.json
+              - .jsclient.version.json
+              - .cli.version.json
+
+      - name: 🚀 Trigger publish workflow
+        if: steps.changes.outputs.version_bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass the full push range to publish.yml so its detect job sees
+          # every file touched across all commits in the merge — we don't
+          # squash, so the version-bump commit may be earlier in the range.
+          FROM_SHA: ${{ github.event.before }}
+          TO_SHA: ${{ github.event.after }}
+        run: |
+          gh workflow run publish.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ github.ref_name }} \
+            -f from_sha="$FROM_SHA" \
+            -f to_sha="$TO_SHA"

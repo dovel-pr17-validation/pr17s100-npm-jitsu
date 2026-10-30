@@ -1,0 +1,17 @@
+{
+  "extends": "@jitsu/common-config/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "lib": ["dom", "esnext"],
+    "jsx": "react",
+    "sourceMap": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "strict": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "useUnknownInCatchVariables": false
+  },
+  "include": ["src"],
+  "exclude": ["dist"]
+}

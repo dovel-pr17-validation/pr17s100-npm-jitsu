@@ -1,0 +1,13 @@
+{
+  "extends": "@jitsu/common-config/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./compiled",
+    "rootDir": ".",
+    "allowJs": true,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src/**/*"
+  ]
+}
+

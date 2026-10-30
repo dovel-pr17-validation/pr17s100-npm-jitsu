@@ -1,0 +1,785 @@
+import "./openapi/setup";
+import { ZodType } from "zod";
+import { NextApiHandler, NextApiRequest, NextApiResponse } from "next";
+import { buildRouteFragment } from "./openapi/routeSpec";
+import { ExpandSpec, RouteOpenApiFragment, StoredMethodSpec } from "./openapi/types";
+import { getRateLimiter, getRateLimitOpts, setRateLimitHeaders, type RouteRateLimitSpec } from "./server/rate-limit";
+import { assertDefined, checkHash, checkRawToken, getErrorMessage, requireDefined, tryJson } from "juava";
+import { getServerSession, Session } from "next-auth";
+import { nextAuthConfig } from "./nextauth.config";
+import { inferTokenTypeFromId, SessionUser } from "./schema";
+import { db } from "./server/db";
+import { isMaintenanceActive, isReadOnly } from "./server/maintenance";
+import { prepareZodObjectForDeserialization, safeParseWithDate } from "./zod";
+import { ApiError } from "./shared/errors";
+import { getServerLog } from "./server/log";
+import { runWithRequestContext } from "./server/request-context";
+import { getFirebaseUser, isFirebaseEnabled } from "./server/firebase-server";
+import { randomUUID } from "crypto";
+import jwt from "jsonwebtoken";
+import { serialize } from "cookie";
+import {
+  validateJwtToken,
+  introspectToken,
+  isJwtToken,
+  isTokenExpired,
+  refreshAccessToken,
+} from "./server/oidc-token-service";
+import { OidcSessionData } from "./server/oidc-types";
+import { isSecure } from "./server/origin";
+import {
+  WorkspaceRoleType,
+  hasPermission,
+  WorkspacePermissionsType,
+  WorkspaceRoleWithPermissions,
+  WorkspaceRolePermissions,
+} from "./workspace-roles";
+import { getServerEnv } from "./server/serverEnv";
+import { adminServiceAccountEmail, isAdminServiceAccount } from "./shared/admin-service-account";
+
+type HandlerOpts<Req = void, Query = void, RequireAuth extends boolean = boolean> = {
+  body?: Req;
+  query?: Query;
+  //todo: make user undefined if RequireAuth is false
+  user: RequireAuth extends true ? SessionUser : SessionUser;
+  req: NextApiRequest;
+  res: NextApiResponse;
+};
+export const httpMethods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] as const;
+export type HttpMethodType = (typeof httpMethods)[number];
+
+const log = getServerLog("api");
+
+export type ApiMeta = {
+  url: string;
+};
+
+export type Api = {
+  [K in HttpMethodType | keyof ApiMeta]?: K extends keyof ApiMeta ? ApiMeta[K] : ApiMethod;
+};
+
+export function inferUrl(file: string) {
+  return file.replace(/.*\/pages\/api/, "/api").replace(/\.ts$/, "");
+}
+
+export type ApiMethod<RequireAuth extends boolean = boolean, Res = any, Body = any, Query = any> = {
+  description?: string;
+  auth: RequireAuth;
+  types?: {
+    body?: ZodType<Body>;
+    result?: ZodType<Res>;
+    query?: ZodType<Query>;
+  };
+  // indicates that handler uses write method for outputting response content. This is useful for streaming responses.
+  streaming?: boolean;
+  rateLimit?: RouteRateLimitSpec;
+  // when true, the route is exempt from the maintenance-mode write block (e.g.
+  // auth, app-config, maintenance, healthcheck, and the admin maintenance endpoint)
+  allowDuringMaintenance?: boolean;
+  // Force the route to be treated as mutating for the maintenance-mode block,
+  // regardless of HTTP method. Use on GET routes that perform real DB writes
+  // (admin cron endpoints, etc.) so they're blocked just like POST/PUT/PATCH/DELETE.
+  // Don't use for handlers that do *incidental* writes during reads (e.g. updating
+  // a `lastUsed` timestamp) — those should remain non-mutating from the gate's
+  // perspective, with the write itself wrapped in try/catch by the caller.
+  mutates?: boolean;
+  handle: (ctx: HandlerOpts<Body, Query, RequireAuth>) => Promise<Res>;
+};
+
+function isApiError(e: any) {
+  return typeof e?.responseObject === "object";
+}
+
+function getUserFromSession(session: Session): SessionUser {
+  assertDefined(session.user, "Session does not have a user");
+  return {
+    internalId: session["internalId"] as string,
+    externalUsername: session["externalUsername"] as string,
+    externalId: session["externalId"] as string,
+    loginProvider: session["loginProvider"] as string,
+    email: session.user.email || "unknown",
+    name: session.user.name || "Unknown",
+    image: session.user?.image,
+    authType: "next-auth",
+  };
+}
+
+function parseIfNeeded(o: any): any {
+  if (typeof o === "string") {
+    return JSON.parse(o);
+  } else {
+    return o;
+  }
+}
+
+export function getAuthBearerToken(req: NextApiRequest): string | undefined {
+  if (req.headers.authorization && req.headers.authorization.toLowerCase().indexOf("bearer ") === 0) {
+    return req.headers.authorization.substring("bearer ".length);
+  } else if (req.query?.__unsafe_token) {
+    //very unsafe, but some tools we use can't set headers, so we need to allow this
+    return req.query.__unsafe_token as string;
+  }
+  return undefined;
+}
+
+function findServiceAccount({ keyId, secret }): SessionUser | undefined {
+  const serverEnv = getServerEnv();
+  let tokens: string[] = [];
+  let checkFunction: (token: string, secret: string) => boolean = () => false;
+  if (serverEnv.CONSOLE_AUTH_TOKENS) {
+    tokens = serverEnv.CONSOLE_AUTH_TOKENS.split(",");
+    checkFunction = checkHash;
+  } else if (serverEnv.CONSOLE_RAW_AUTH_TOKENS) {
+    tokens = serverEnv.CONSOLE_RAW_AUTH_TOKENS.split(",");
+    checkFunction = checkRawToken;
+  }
+  if (tokens.length > 0) {
+    for (const tokenHashOrPlain of tokens) {
+      if (checkFunction(tokenHashOrPlain, secret)) {
+        return {
+          internalId: adminServiceAccountEmail,
+          externalUsername: adminServiceAccountEmail,
+          externalId: adminServiceAccountEmail,
+          loginProvider: "admin/token",
+          email: adminServiceAccountEmail,
+          name: adminServiceAccountEmail,
+          authType: "bearer",
+        };
+      }
+    }
+  }
+}
+
+async function getUserFromOidcSession(req: NextApiRequest, res?: NextApiResponse): Promise<SessionUser | undefined> {
+  const serverEnv = getServerEnv();
+  if (!serverEnv.DYNAMIC_OIDC_ENABLED) {
+    return undefined;
+  }
+
+  // Check for OIDC session cookie (for API requests from OIDC-authenticated users)
+  const oidcSessionCookie = req.cookies?.["oidc-session"];
+  if (!oidcSessionCookie) {
+    return undefined;
+  }
+
+  try {
+    // Verify the OIDC session token
+    let sessionData: OidcSessionData = jwt.verify(oidcSessionCookie, nextAuthConfig.secret!) as OidcSessionData;
+    let tokensRefreshed = false;
+
+    // Validate OIDC tokens if present
+    const providerId = sessionData.providerId;
+    if (sessionData.tokens && providerId) {
+      const { accessToken, refreshToken, expiresAt } = sessionData.tokens;
+
+      // Check if access token is expired
+      if (isTokenExpired(expiresAt)) {
+        log.atInfo().log("Access token expired in API request, attempting refresh", { userId: sessionData.userId });
+
+        // Try to refresh the token if we have a refresh token
+        if (refreshToken) {
+          const refreshResult = await refreshAccessToken(refreshToken, providerId);
+
+          if (refreshResult.success && refreshResult.tokens) {
+            log.atInfo().log("Successfully refreshed access token in API request", { userId: sessionData.userId });
+
+            // Update session data with new tokens
+            sessionData = {
+              ...sessionData,
+              timestamp: Date.now(),
+              tokens: refreshResult.tokens,
+            };
+            tokensRefreshed = true;
+          } else {
+            log.atWarn().log("Failed to refresh access token in API request", {
+              userId: sessionData.userId,
+              error: refreshResult.error,
+            });
+            return undefined; // Cannot refresh, need re-authentication
+          }
+        } else {
+          log.atWarn().log("No refresh token available for expired access token", { userId: sessionData.userId });
+          return undefined; // No refresh token, need re-authentication
+        }
+      }
+
+      // Validate the (possibly refreshed) access token
+      const currentAccessToken = sessionData.tokens!.accessToken;
+      let tokenValid = false;
+
+      if (isJwtToken(currentAccessToken)) {
+        // Validate JWT token using JWKS
+        const validation = await validateJwtToken(currentAccessToken, providerId);
+        tokenValid = validation.valid;
+
+        if (!tokenValid) {
+          log.atWarn().log("JWT token validation failed in API request", {
+            userId: sessionData.userId,
+            error: validation.error,
+          });
+        }
+      } else {
+        // Use token introspection for opaque tokens
+        const introspection = await introspectToken(currentAccessToken, providerId);
+        tokenValid = introspection.valid;
+
+        if (!tokenValid) {
+          log.atWarn().log("Token introspection failed in API request", {
+            userId: sessionData.userId,
+            error: introspection.error,
+          });
+        }
+      }
+
+      if (!tokenValid) {
+        log.atWarn().log("OIDC token validation failed in API request", { userId: sessionData.userId });
+        return undefined; // Invalid token, need re-authentication
+      }
+
+      // If tokens were refreshed, update the session cookie
+      if (tokensRefreshed && res) {
+        const newSessionToken = jwt.sign(sessionData, nextAuthConfig.secret!);
+
+        res.setHeader(
+          "Set-Cookie",
+          serialize("oidc-session", newSessionToken, {
+            httpOnly: true,
+            secure: isSecure(req),
+            sameSite: "strict",
+            maxAge: 7 * 24 * 60 * 60, // 7 days
+            path: "/",
+          })
+        );
+
+        log.atInfo().log("Updated session cookie with refreshed tokens", { userId: sessionData.userId });
+      }
+    }
+
+    // Convert OIDC session to SessionUser format
+    return {
+      internalId: sessionData.userId,
+      externalUsername: sessionData.email || sessionData.name || "unknown",
+      externalId: sessionData.externalId,
+      loginProvider: sessionData.loginProvider,
+      email: sessionData.email || "unknown",
+      name: sessionData.name || "Unknown",
+      authType: "oidc",
+    };
+  } catch (error) {
+    log.atWarn().withCause(error).log("Invalid OIDC session cookie");
+    return undefined;
+  }
+}
+
+export async function getUser(
+  res: NextApiResponse,
+  req: NextApiRequest,
+  checkRevoked?: boolean
+): Promise<SessionUser | undefined> {
+  const bearerToken = getAuthBearerToken(req);
+  if (bearerToken) {
+    const [keyId, secret] = bearerToken.split(":");
+    if (!secret) {
+      throw new ApiError("Bearer token should have a format of keyId:secret", { status: 401 });
+    }
+    const serviceAccount = findServiceAccount({ keyId, secret });
+    if (serviceAccount) {
+      return serviceAccount;
+    }
+    if (keyId && secret) {
+      //auth based on an API key
+      const token = await db.prisma().userApiToken.findUnique({ where: { id: keyId } });
+      if (!token) {
+        throw new ApiError(`Invalid API key id ${keyId}`, { status: 401, responseObject: { keyId } });
+      }
+      if (!checkHash(token.hash, secret)) {
+        throw new ApiError(`Invalid API key secret for ${keyId}`, { status: 401, responseObject: { keyId } });
+      }
+      // MCP refresh tokens are stored in UserApiToken but must not be usable
+      // as general Console API bearer keys — they are scoped to MCP only.
+      if (token.oauthClientId) {
+        throw new ApiError(`MCP refresh tokens cannot be used as Console API bearer keys`, {
+          status: 401,
+          responseObject: { keyId },
+        });
+      }
+      if (token.expiresAt && token.expiresAt.getTime() < Date.now()) {
+        throw new ApiError(`API key ${keyId} has expired`, { status: 401, responseObject: { keyId } });
+      }
+      const user = requireDefined(
+        await db.prisma().userProfile.findUnique({ where: { id: token.userId } }),
+        `Can't find user ${token.userId} for API key ${keyId}`
+      );
+      // Best-effort lastUsed bookkeeping — must never break auth. Read-only
+      // backstops (Prisma read-only extension or future DB-side restrictions)
+      // would reject this write; swallow the error so the read-path call still
+      // authenticates the user.
+      try {
+        await db.prisma().userApiToken.update({ where: { id: keyId }, data: { lastUsed: new Date() } });
+      } catch (e: any) {
+        log.atWarn().withCause(e).log(`Failed to bump lastUsed for API key ${keyId}`);
+      }
+      return {
+        internalId: user.id,
+        externalUsername: user.externalUsername,
+        externalId: user.externalId,
+        loginProvider: user.loginProvider,
+        email: user.email,
+        name: user.name,
+        authType: "bearer",
+        tokenId: token.id,
+        tokenType: token.type ?? inferTokenTypeFromId(token.id),
+      };
+    }
+  }
+
+  const oidcUser = await getUserFromOidcSession(req, res);
+  if (oidcUser) {
+    return oidcUser;
+  }
+
+  if (isFirebaseEnabled()) {
+    return await getFirebaseUser(req, checkRevoked);
+  }
+  const session = await getServerSession(req, res, nextAuthConfig);
+  return session ? getUserFromSession(session) : undefined;
+}
+
+export function nextJsApiHandler(api: Api): NextApiHandler {
+  const handleRequest = async (req: NextApiRequest, res: NextApiResponse) => {
+    const method = req.method as HttpMethodType;
+    const handler = api[method];
+    if (!handler) {
+      res.status(405).json({ error: `${method} method not supported` });
+      return;
+    }
+    // Real read-only during maintenance: reject mutating requests at the API
+    // layer (the Prisma read-only extension is a further backstop). The gate
+    // treats a request as mutating if its HTTP method is POST/PUT/PATCH/DELETE
+    // OR the route explicitly opts in via `mutates: true` (for GET routes that
+    // actually write — admin cron endpoints, etc.). Routes that must keep
+    // working (auth, app-config, maintenance, healthcheck, admin maintenance
+    // toggle, read-only POSTs) opt out via `allowDuringMaintenance`.
+    //
+    // For `auth: true` routes, the gate runs *after* getUser so anonymous
+    // callers still see 401/403 with their original semantics and we don't
+    // leak maintenance state to unauthenticated probes (relevant when the
+    // descriptor sets `visible: false`).
+    const isMutatingMethod = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+    const isMutating = isMutatingMethod || !!handler.mutates;
+    const writeBlocked = isMutating && !handler.allowDuringMaintenance && isReadOnly();
+    // Distinguish the two reasons writes are blocked. A time-boxed maintenance
+    // window keeps the maintenance-coded 503 the frontend renders a banner for.
+    // The permanent read-only switch (JITSU_CONSOLE_READ_ONLY — canary/preview
+    // deployments, JITSU-159) must NOT masquerade as maintenance: there is no
+    // window to "end", and mislabeling it skews clients and alerting. It just
+    // rejects the write plainly.
+    const writeBlockedResponse = () =>
+      isMaintenanceActive()
+        ? { error: "maintenance", message: "Jitsu is in maintenance mode; modifications are temporarily disabled." }
+        : { error: "read_only", message: "This Jitsu deployment is read-only; modifications are disabled." };
+    if (writeBlocked && !handler.auth) {
+      res.status(503).json(writeBlockedResponse());
+      return;
+    }
+    let currentUser: SessionUser | undefined = undefined;
+
+    try {
+      //let session: Session | undefined | null = undefined;
+      if (handler.auth) {
+        currentUser = await getUser(res, req);
+        if (!currentUser) {
+          res.status(401).send({ error: "Authorization Required" });
+          return;
+        }
+        // Auth-required routes only learn about the write block *after* successful
+        // auth — see the rationale above.
+        if (writeBlocked) {
+          res.status(503).json(writeBlockedResponse());
+          return;
+        }
+      }
+      const rlOpts = getRateLimitOpts(req, currentUser, { method, rateLimit: handler.rateLimit });
+      if (rlOpts) {
+        try {
+          const rl = await getRateLimiter().check(rlOpts);
+          setRateLimitHeaders(res, rl);
+          if (!rl.allowed) {
+            log
+              .atWarn()
+              .log(
+                `rate limit exceeded: ${req.method} ${req.url} bucket=${rl.bucket} limit=${rl.limit} retryAfterSec=${
+                  rl.retryAfterSec
+                } user=${currentUser?.internalId ?? "anon"}`
+              );
+            res.setHeader("Retry-After", String(rl.retryAfterSec));
+            res.status(429).json({
+              error: "rate_limit_exceeded",
+              message: `Rate limit exceeded. Retry after ${rl.retryAfterSec} seconds.`,
+              limit: rl.limit,
+              remaining: 0,
+              resetAt: rl.resetAt.toISOString(),
+              bucket: rl.bucket,
+            });
+            return;
+          }
+        } catch (e) {
+          // Fail closed: the limiter store is unavailable, so we reject rather than
+          // silently letting everyone through. A future per-route failOpen flag can
+          // carve exceptions when we need them.
+          log.atWarn().withCause(e).log(`rate limiter unavailable for ${req.method} ${req.url}`);
+          res.setHeader("Retry-After", "5");
+          res.status(503).json({
+            error: "rate_limit_unavailable",
+            message: "Rate limiter store is unavailable; request rejected.",
+          });
+          return;
+        }
+      }
+      let body = undefined;
+      if (req.body && handler.types?.body) {
+        const parseResult = handler.types?.body.safeParse(
+          req.body ? prepareZodObjectForDeserialization(parseIfNeeded(req.body)) : undefined
+        );
+
+        if (!parseResult.success) {
+          throw new ApiError(`Can't parse request body for ${req.method} ${req.url}`, {
+            responseObject: {
+              zodError: parseResult.error,
+              body: tryJson(req.body),
+            },
+          });
+        }
+        body = parseResult.data;
+      } else if (req.body) {
+        try {
+          body = parseIfNeeded(req.body);
+        } catch (e) {
+          throw new ApiError(`Body ${req.method} ${req.url} is not a JSON object: ${getErrorMessage(e)}`, {
+            responseObject: {
+              body: req.body,
+            },
+          });
+        }
+      }
+      let query: any = undefined;
+      if (handler.types?.query) {
+        const parseResult = safeParseWithDate(handler.types?.query, req.query);
+        if (!parseResult.success) {
+          throw new ApiError(`Can't parse request query for ${req.method} ${req.url}`, {
+            responseObject: {
+              zodError: parseResult.error,
+            },
+          });
+        }
+        query = parseResult.data;
+      } else {
+        query = req.query;
+      }
+
+      const result = await handler.handle({ body, req, res, query, user: currentUser as any });
+      if (handler.streaming) {
+        //we cannot do anything with the result, it is the responsibility of the handler to write the response
+        return;
+      }
+      if (handler.types?.result) {
+        const parseResult = handler.types?.result.safeParse(result);
+        if (!parseResult.success) {
+          log
+            .atDebug()
+            .log(
+              `Api method zod mismatch at ${req.method} ${req.url}. Obj: ${JSON.stringify(
+                result,
+                null,
+                2
+              )}. Zod error: ${JSON.stringify(parseResult.error)}`
+            );
+          throw new ApiError(`Response for ${req.method} ${req.url} doesn't match required schema`, {
+            responseObject: {
+              zodError: parseResult.error,
+            },
+          });
+        }
+        //do not set explicit 200 status here. If the status has been set by the handler, we should respect it. There's
+        //no way to check if the status has been set. If status is not set here and in handler, Next.js will set 200 by default.
+        res.json(parseResult.data);
+      } else {
+        res.json(result || { success: true });
+      }
+    } catch (e: any) {
+      if (isApiError(e)) {
+        const errorBody = {
+          message: e?.message || "Unknown Error",
+          ...e.responseObject,
+        };
+        const status = e.status || 500;
+        if (status === 500) {
+          errorBody.stack = e.stack;
+          log
+            .atError()
+            .withCause(e)
+            .log(`Request for ${req.method} ${req.url} failed - ${JSON.stringify(e.responseObject)}`);
+        } else {
+          log
+            .atError()
+            .log(
+              `Request for ${req.method} ${req.url} failed - ${JSON.stringify(e.responseObject)}: ${errorBody.message}`
+            );
+        }
+        res.status(status).send(errorBody);
+      } else {
+        log.atError().withCause(e).log(`Request for ${req.method} ${req.url} failed`);
+        res
+          .status(500)
+          .send({ error: tryJson(getErrorMessage(e)), details: e?.stack, stackArray: stackToArray(e?.stack) });
+      }
+    }
+  };
+  return async (req: NextApiRequest, res: NextApiResponse) => {
+    // Bind the inbound nginx X-Request-ID (or a generated fallback) to the async
+    // context so every log line for this request carries request_id → @request_id
+    // in Datadog, enabling an exact edge-5xx ↔ app-stack join (JITSU-104).
+    const rawRequestId = req.headers["x-request-id"];
+    const headerRequestId = Array.isArray(rawRequestId) ? rawRequestId[0] : rawRequestId;
+    // trim() so a blank/whitespace header falls back to a real id instead of
+    // collapsing distinct requests under an empty-ish @request_id.
+    const requestId = headerRequestId?.trim() || randomUUID();
+    return runWithRequestContext({ request_id: requestId }, () => handleRequest(req, res));
+  };
+}
+
+function stackToArray(stack?: string) {
+  if (!stack) {
+    return undefined;
+  }
+  const lines = stack.split("\n");
+  return lines.length > 0 ? lines.map(s => s.trim()) : undefined;
+}
+export async function verifyAdmin(user: SessionUser) {
+  if (isAdminServiceAccount(user)) {
+    return;
+  }
+  const userId = requireDefined(user.internalId, `internalId is not defined`);
+  if ((await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin) {
+    return;
+  }
+  throw new ApiError(`User ${userId} is not an admin`, { status: 403 });
+}
+
+export function looksLikeCuid(id: string) {
+  return id.length === 25 && id.charAt(0) === "c";
+}
+
+export async function getWorkspace(workspaceId: string | undefined) {
+  return requireDefined(
+    await db.prisma().workspace.findFirst({
+      where: {
+        OR: [
+          {
+            id: workspaceId,
+          },
+          {
+            slug: workspaceId,
+          },
+        ],
+        deleted: false,
+      },
+    }),
+    `Workspace ${workspaceId} not found`
+  );
+}
+
+export async function verifyAccess(user: SessionUser, workspaceId: string) {
+  if (isAdminServiceAccount(user)) {
+    return;
+  }
+  if (!looksLikeCuid(workspaceId)) {
+    const w = await db.prisma().workspace.findFirst({ where: { slug: workspaceId } });
+    if (w) {
+      workspaceId = w.id;
+    }
+  }
+  const userId = requireDefined(user.internalId, `internalId is not defined`);
+  if ((await db.prisma().workspaceAccess.count({ where: { userId, workspaceId } })) === 0) {
+    if ((await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin) {
+      return;
+    }
+    throw new ApiError(`User ${userId} doesn't have access to workspace ${workspaceId}`, {
+      status: 403,
+      responseObject: { workspaceId, userId },
+    });
+  }
+}
+
+export async function verifyAccessWithRole(
+  user: SessionUser,
+  workspaceId: string,
+  requiredPermission: WorkspacePermissionsType
+): Promise<WorkspaceRoleWithPermissions> {
+  if (isAdminServiceAccount(user)) {
+    return {
+      role: "owner",
+      ...WorkspaceRolePermissions["owner"],
+    };
+  }
+
+  if (!looksLikeCuid(workspaceId)) {
+    const w = await db.prisma().workspace.findFirst({ where: { slug: workspaceId } });
+    if (w) {
+      workspaceId = w.id;
+    }
+  }
+
+  const userId = requireDefined(user.internalId, `internalId is not defined`);
+  const access = await db.prisma().workspaceAccess.findFirst({
+    where: { userId, workspaceId },
+  });
+
+  if (!access) {
+    // Check if user is admin
+    if ((await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin) {
+      return {
+        role: "owner",
+        ...WorkspaceRolePermissions["owner"],
+      };
+    }
+    throw new ApiError(`User ${userId} doesn't have access to workspace ${workspaceId}`, {
+      status: 403,
+      responseObject: { workspaceId, userId },
+    });
+  }
+
+  const role = (access.role || "owner") as WorkspaceRoleType;
+
+  if (!hasPermission(role, requiredPermission)) {
+    throw new ApiError(
+      `User ${userId} doesn't have permission '${requiredPermission}' in workspace ${workspaceId}. Required role: owner or editor`,
+      { status: 403, responseObject: { workspaceId, userId, role, requiredPermission } }
+    );
+  }
+
+  // A workspace carrying the `readonly` feature flag (set for billing
+  // enforcement, e.g. unpaid invoices — JITSU-123) rejects entity mutations at
+  // the API level; the UI lock alone is trivially bypassed with an API token.
+  // Reads stay open, and `manageUsers` deliberately stays role-gated only —
+  // inviting the teammate who holds the credit card must remain possible.
+  // Jitsu admins and service accounts bypass via the short-circuits above.
+  if (requiredPermission === "editEntities" || requiredPermission === "deleteEntities") {
+    const workspace = await db.prisma().workspace.findFirst({
+      where: { id: workspaceId },
+      select: { featuresEnabled: true },
+    });
+    if (workspace?.featuresEnabled?.includes("readonly")) {
+      // Jitsu admins bypass readonly even when they hold an explicit
+      // workspaceAccess row (the earlier short-circuit only covers admins
+      // without one).
+      const isAdmin = (await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin;
+      if (!isAdmin) {
+        throw new ApiError(
+          `Workspace is in read-only mode due to billing issues. Please resolve them on the billing page to restore access.`,
+          { status: 403, responseObject: { workspaceId, userId, role, requiredPermission, readonly: true } }
+        );
+      }
+    }
+  }
+
+  return {
+    role,
+    ...WorkspaceRolePermissions[role],
+  };
+}
+//new type-safe route builder
+
+export type RouteMethodSpec<
+  QueryZodType extends ZodType = never,
+  BodyZodType extends ZodType = never,
+  ResultZodType extends ZodType = any,
+  RequireAuth extends undefined | boolean = false
+> = {
+  description?: string;
+  summary?: string;
+  tags?: string[];
+  query?: QueryZodType;
+  body?: BodyZodType;
+  result?: ResultZodType;
+  auth?: RequireAuth;
+  streaming?: boolean;
+  bodyExample?: any;
+  resultExample?: any;
+  expand?: ExpandSpec;
+  rateLimit?: RouteRateLimitSpec;
+  allowDuringMaintenance?: boolean;
+  mutates?: boolean;
+};
+
+export type RouteBuilderBase = {
+  [K in HttpMethodType]: <
+    QueryZodType extends ZodType = never,
+    BodyZodType extends ZodType = never,
+    ResultZodType extends ZodType = any,
+    RequireAuth extends undefined | boolean = false
+  >(
+    spec: RouteMethodSpec<QueryZodType, BodyZodType, ResultZodType, RequireAuth>
+  ) => {
+    handler: (
+      handler: (params: {
+        query: QueryZodType extends ZodType<infer QueryType> ? QueryType : never;
+        body: BodyZodType extends ZodType<infer BodyType> ? BodyType : never;
+        req: NextApiRequest;
+        res: NextApiResponse;
+        user: RequireAuth extends true ? SessionUser : never;
+      }) => ResultZodType extends ZodType<infer ResultType> ? ResultType | Promise<ResultType> : void | Promise<void>
+    ) => RouteBuilder;
+  };
+};
+
+export type RouteBuilder = RouteBuilderBase & {
+  toNextApiHandler(): NextApiHandler;
+  toOpenAPISpec(opts: { basePath: string }): RouteOpenApiFragment;
+};
+
+export function createRoute(): RouteBuilder {
+  const legacyApiInstance: Api = {};
+  const specByMethod: Partial<Record<HttpMethodType, StoredMethodSpec>> = {};
+  const builder: any = {};
+  for (const method of httpMethods) {
+    builder[method] = (spec: RouteMethodSpec<any, any, any, any> & { description?: string }) => {
+      return {
+        handler: handler => {
+          legacyApiInstance[method] = {
+            auth: !!spec.auth,
+            types: { query: spec.query, body: spec.body, result: spec.result },
+            handle: handler,
+            streaming: spec.streaming,
+            description: spec.description,
+            rateLimit: spec.rateLimit,
+            allowDuringMaintenance: spec.allowDuringMaintenance,
+            mutates: spec.mutates,
+          };
+          specByMethod[method] = {
+            query: spec.query,
+            body: spec.body,
+            result: spec.result,
+            auth: !!spec.auth,
+            streaming: spec.streaming,
+            summary: spec.summary,
+            description: spec.description,
+            tags: spec.tags,
+            bodyExample: spec.bodyExample,
+            resultExample: spec.resultExample,
+            expand: spec.expand,
+          };
+          return builder;
+        },
+      };
+    };
+  }
+  builder.toNextApiHandler = () => {
+    return nextJsApiHandler(legacyApiInstance);
+  };
+  builder.toOpenAPISpec = ({ basePath }: { basePath: string }) => {
+    return buildRouteFragment(basePath, specByMethod);
+  };
+
+  return builder as RouteBuilder;
+}

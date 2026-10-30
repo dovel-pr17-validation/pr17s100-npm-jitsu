@@ -1,0 +1,57 @@
+{
+  "name": "@jitsu/destination-functions",
+  "version": "0.0.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "description": "",
+  "author": "Jitsu Dev Team <dev@jitsu.com>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src/meta.ts",
+    "src/reverse-etl/**",
+    "src/functions/google-ads/**",
+    "src/functions/webhook/**",
+    "src/functions/facebook/**",
+    "src/functions/microsoft-ads/**",
+    "src/functions/lib/**",
+    "src/functions/google-ads-destination.ts"
+  ],
+  "license": "MIT",
+  "private": false,
+  "scripts": {
+    "build": "exit 0",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf ./dist",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@jitsu/common-config": "workspace:*",
+    "@jitsu/functions-lib": "workspace:*",
+    "@jitsu/protocols": "workspace:*",
+    "@jitsu/sdk-js": "^3.1.5",
+    "@types/lodash": "catalog:",
+    "@types/node": "catalog:",
+    "@types/yauzl": "^3.4.0",
+    "@vitest/ui": "catalog:",
+    "json5": "^2.1.0",
+    "msw": "^2.15.0",
+    "vite": "^6.4.3",
+    "vitest": "catalog:"
+  },
+  "dependencies": {
+    "@amplitude/ua-parser-js": "^0.7.33",
+    "@hubspot/api-client": "^11.1.0",
+    "@jitsu/core-functions-lib": "workspace:*",
+    "csv-parse": "^7.0.3",
+    "juava": "workspace:*",
+    "lodash": "catalog:",
+    "node-cache": "^5.1.2",
+    "posthog-node": "^5.44.0",
+    "tslib": "catalog:",
+    "undici": "^7.29.1",
+    "yauzl": "^3.4.0",
+    "zod": "^3.23.8"
+  }
+}

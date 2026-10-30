@@ -1,0 +1,29 @@
+{
+  "name": "juava",
+  "version": "0.0.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "description": "",
+  "author": "Jitsu Dev Team <dev@jitsu.com>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "private": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "exit 0",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@jitsu/common-config": "workspace:*",
+    "@types/node": "catalog:",
+    "@vitest/ui": "catalog:",
+    "vitest": "catalog:",
+    "vite": "^6.4.3"
+  },
+  "dependencies": {
+    "lodash": "catalog:",
+    "tslib": "catalog:"
+  }
+}

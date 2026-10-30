@@ -1,0 +1,598 @@
+import { getLog, isTruish, LogLevel, setGlobalLogLevel } from "juava";
+import { AppProps } from "next/app";
+import "../styles/globals.css";
+import { useRouter } from "next/router";
+import React, { PropsWithChildren, useEffect, useState } from "react";
+import { SessionProvider, signOut, useSession } from "next-auth/react";
+import { GlobalLoader } from "../components/GlobalLoader/GlobalLoader";
+import { branding } from "../lib/branding";
+import { Alert } from "antd";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  AppConfigContextProvider,
+  useAppConfig,
+  UserContextProvider,
+  useUser,
+  useUserSafe,
+  WorkspaceContextProvider,
+} from "../lib/context";
+import { AppConfig, ContextApiResponse, SessionUser } from "../lib/schema";
+import { ErrorBoundary, GlobalError, GlobalOverlay } from "../components/GlobalError/GlobalError";
+import { ErrorOrMaintenance, formatUtc, MaintenancePage } from "../components/Maintenance/Maintenance";
+import { feedbackSuccess, useTitle } from "../lib/ui";
+import { useApi } from "../lib/useApi";
+import { AntdTheme } from "../components/AntdTheme/AntdTheme";
+import { AntdModalProvider } from "../lib/modal";
+import Head from "next/head";
+import { JitsuProvider, useJitsu } from "@jitsu/jitsu-react";
+import { FirebaseProvider, PassiveFirebaseAuthResult, useFirebaseSession } from "../lib/firebase-client";
+import { VerifyEmailGate } from "../components/SignInOrUp/VerifyEmailGate";
+import { FirebaseSignup } from "../components/SignInOrUp/FirebaseSignup";
+import { JitsuButton } from "../components/JitsuButton/JitsuButton";
+import { BillingProvider } from "../components/Billing/BillingProvider";
+import { useConfigObjectsUpdater, useLoadedWorkspace } from "../lib/store";
+import { useQuery } from "@tanstack/react-query";
+import { get } from "../lib/useApi";
+import { WorkspaceRoleType, WorkspaceRoleWithPermissions, WorkspaceRolePermissions } from "../lib/workspace-roles";
+import { RedirectToSignIn } from "../components/Redirect/Redirect";
+import { PreviousRouteContextProvider } from "../lib/previous-route";
+import { OidcAuthorizer } from "../components/OidcAuthorizer/OidcAuthorizer";
+import { ChangePassword } from "../components/ChangePassword/ChangePassword";
+import { getClientEnv } from "../lib/shared/clientEnv";
+
+const log = getLog("app");
+
+function getUserFromNextJsSession(session: any): ContextApiResponse["user"] {
+  if (session && session?.data) {
+    return { ...session.data, ...session.data?.user } as any;
+  } else {
+    throw new Error("Session data is not available");
+  }
+}
+
+export function Analytics({ user }: { user?: SessionUser }) {
+  const { analytics } = useJitsu();
+  const router = useRouter();
+  /* eslint-disable react-hooks/exhaustive-deps  */
+  //user may be a new object on each render while being the same user
+  useEffect(() => {
+    //workspace events tracked separately in WorkspacePageLayout
+    if (!router.query.workspaceId && user?.internalId) {
+      analytics.identify(user.internalId, {
+        email: user.email,
+        name: user.name,
+        loginProvider: user.loginProvider,
+        externalId: user.externalId,
+      });
+    }
+  }, [user?.internalId, analytics, router.query.workspaceId]);
+  /* eslint-enable */
+
+  useEffect(() => {
+    if (!router.query.workspaceId) {
+      analytics.page({});
+    }
+    //workspace page views are tracked separately in WorkspacePageLayout
+  }, [router.asPath, analytics, router.query.workspaceId]);
+  return <React.Fragment />;
+}
+
+const FirebaseAuthorizer: React.FC<PropsWithChildren<{}>> = ({ children }) => {
+  const session = useFirebaseSession();
+  const [result, setResult] = useState<PassiveFirebaseAuthResult | null>();
+  const [loading, setLoading] = useState<boolean>(true);
+  const [authError, setAuthError] = useState<any>(undefined);
+  const router = useRouter();
+
+  /* eslint-disable react-hooks/exhaustive-deps  */
+  //following the rule and adding session to deps will create an
+  //endless token refresh cycle
+  useEffect(() => {
+    const { user, cleanup } = session.resolveUser(router.query.token as string);
+    user
+      .then(setResult)
+      .catch(setAuthError)
+      .finally(() => setLoading(false));
+    return cleanup;
+  }, []);
+  /* eslint-enable */
+
+  useEffect(() => {
+    if (router.query.projectName) {
+      localStorage.setItem("projectName", router.query.projectName as string);
+    }
+  }, [router.query.projectName]);
+
+  // JITSU-70: the server already deleted the rejected account, so clear the
+  // stale client session — otherwise `auth().currentUser` stays a deleted user
+  // and later fb-auth calls fail until a refresh. We still render the signup
+  // form below; signing out only resets the in-memory Firebase session.
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => {
+    if (result?.status === "personal-email-rejected") {
+      session.signOut();
+    }
+  }, [result?.status]);
+  /* eslint-enable */
+
+  if (loading) {
+    return <GlobalLoader title={"Authorizing"} />;
+  } else if (authError) {
+    return <GlobalError error={authError} title={"Authorization error"} />;
+  } else if (!result) {
+    return <RedirectToSignIn />;
+  } else if (result.status === "email-not-verified") {
+    return <VerifyEmailGate email={result.email} />;
+  } else if (result.status === "personal-email-rejected") {
+    // No special page — drop the user back on the signup form with the note.
+    return <FirebaseSignup initialError={result.message} />;
+  } else {
+    return (
+      <UserContextProvider
+        user={result.user}
+        logout={async () => {
+          await session.signOut().then(() => {
+            setResult(null);
+          });
+          router.push("/signin");
+        }}
+      >
+        {children}
+      </UserContextProvider>
+    );
+  }
+};
+
+// Combined authorizer that handles both Firebase and OIDC authentication
+const CombinedAuthorizer: React.FC<
+  PropsWithChildren<{ authorizer: "firebase" | "nextauth"; dynamicOidcEnabled: boolean }>
+> = ({ children, authorizer, dynamicOidcEnabled }) => {
+  if (dynamicOidcEnabled) {
+    return (
+      <OidcAuthorizer>
+        <NestedAuthorizer authorizer={authorizer}>{children}</NestedAuthorizer>
+      </OidcAuthorizer>
+    );
+  } else if (authorizer === "nextauth") {
+    return <NextJsAuthorizer>{children}</NextJsAuthorizer>;
+  } else if (authorizer === "firebase") {
+    return <FirebaseAuthorizer>{children}</FirebaseAuthorizer>;
+  }
+};
+
+const NestedAuthorizer: React.FC<PropsWithChildren<{ authorizer: "firebase" | "nextauth" }>> = ({
+  children,
+  authorizer,
+}) => {
+  const user = useUserSafe();
+  if (user) {
+    return children;
+  }
+  if (authorizer === "nextauth") {
+    return <NextJsAuthorizer>{children}</NextJsAuthorizer>;
+  } else if (authorizer === "firebase") {
+    return <FirebaseAuthorizer>{children}</FirebaseAuthorizer>;
+  }
+};
+
+const NextJsAuthorizer: React.FC<PropsWithChildren<{}>> = ({ children }) => {
+  const session = useSession();
+  const router = useRouter();
+
+  if (session && session.data) {
+    const user = getUserFromNextJsSession(session);
+    if (user.mustChangePassword) {
+      return (
+        <div className="flex flex-col items-center p-12">
+          <h1 className="text-xl">You must change your password</h1>
+          <div className="max-w-96 min-w-96 mx-auto">
+            <ChangePassword
+              dontAskForCurrentPassword={true}
+              onSuccess={async () => {
+                await signOut();
+                router.push("/signin");
+                feedbackSuccess("Password has been changed. Please sign in with your new password.");
+              }}
+            />
+          </div>
+        </div>
+      );
+    }
+    return (
+      <UserContextProvider
+        user={user}
+        logout={async () => {
+          signOut().then(() => router.push("/signin"));
+        }}
+      >
+        {children}
+      </UserContextProvider>
+    );
+  } else if (session.status === "loading") {
+    return <GlobalLoader title={"Authorizing..."} />;
+  }
+  return <RedirectToSignIn />;
+};
+
+function LoginWrapper(props: PropsWithChildren<{ requiresLogin: boolean }>) {
+  const appConfig = useAppConfig();
+  if (!props.requiresLogin) {
+    return (
+      <FirebaseProvider appConfig={appConfig}>
+        <Analytics />
+        {props.children}
+      </FirebaseProvider>
+    );
+  } else {
+    return (
+      <FirebaseProvider appConfig={appConfig}>
+        <CombinedAuthorizer
+          authorizer={appConfig.auth?.firebasePublic ? "firebase" : "nextauth"}
+          dynamicOidcEnabled={!!appConfig.auth?.dynamicOidc}
+        >
+          {props.children}
+        </CombinedAuthorizer>
+      </FirebaseProvider>
+    );
+  }
+}
+
+const ProgressBar0: React.FC<{ className?: string }> = ({ className }) => {
+  const [running, setRunning] = useState(true);
+  const [progress, setProgress] = useState(0);
+  useEffect(() => {
+    if (running) {
+      let interval = setInterval(() => {
+        setProgress(prev => Math.min(prev + Math.round(Math.random() * 10), 100));
+      }, 100);
+      return () => clearInterval(interval);
+    }
+  }, [running]);
+
+  useEffect(() => {
+    if (progress === 100) {
+      setRunning(false);
+    }
+  }, [progress]);
+
+  return (
+    <div
+      style={{ width: `${Math.min(progress, 100)}%`, minWidth: `${Math.min(progress, 100)}%`, color: "white" }}
+      className={className}
+    />
+  );
+};
+
+const ProgressBar = React.memo(ProgressBar0);
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: false,
+      cacheTime: 0,
+      staleTime: 0,
+      refetchOnWindowFocus: false,
+      refetchOnMount: false,
+    },
+  },
+});
+
+if (typeof window !== "undefined") {
+  window["queryClient"] = queryClient;
+}
+
+function AppLoader({ children, pageProps }: PropsWithChildren<any>) {
+  // Poll every 60s so an operator flipping the maintenance ConfigMap
+  // propagates to all open sessions without a page reload (the file-read
+  // cache on the server is 10s, so 60s is the visible upper bound).
+  const { data, isLoading, error } = useApi<AppConfig>(`/api/app-config`, { refetchInterval: 60_000 });
+  const [origin, setOrigin] = useState<string | undefined>();
+
+  useEffect(() => {
+    setOrigin(window.location.origin);
+  }, []);
+
+  if (isLoading || !origin) {
+    return <GlobalLoader title={"Loading application..."} />;
+  } else if (error) {
+    return <ErrorOrMaintenance error={error} title="Application failed to initialize" />;
+  }
+  // When maintenance declares the DB unavailable, the rest of the app can't function
+  // (it issues DB-backed queries on mount). Short-circuit to the maintenance page instead
+  // of letting downstream components render and crash.
+  if (data!.maintenance?.active && data!.maintenance?.database_access === "off") {
+    return <MaintenancePage maintenance={data!.maintenance} />;
+  }
+  let originUrl;
+  try {
+    originUrl = new URL(origin);
+  } catch (e) {
+    return <GlobalError error={e} title={`Origin ${origin} is not parseable url`} />;
+  }
+
+  if (originUrl.hostname !== data.publicEndpoints.host) {
+    getLog()
+      .atWarn()
+      .log(`Origin ${origin} host ('${originUrl.hostname}') doesn't match public host '${data.publicEndpoints.host}'`);
+    return (
+      <div className={"h-screen w-screen flex justify-center items-center"}>
+        <div>
+          Nothing here.{" "}
+          <a
+            className="underline text-primary"
+            href={`${data.publicEndpoints.protocol}://${data.publicEndpoints.host}${
+              data.publicEndpoints.port ? `:${data.publicEndpoints.port}` : ""
+            }`}
+          >
+            Open management console
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  const clientEnv = getClientEnv();
+  const trackingHost = data!.frontendTelemetry.enabled ? data!.frontendTelemetry.host : undefined;
+  return (
+    <AppConfigContextProvider config={data!}>
+      <Head>
+        <title>Jitsu</title>
+      </Head>
+      <JitsuProvider
+        options={
+          trackingHost
+            ? {
+                //debug: data?.logLevel === "debug",
+                debug: isTruish(clientEnv.NEXT_PUBLIC_TELEMETRY_DEBUG),
+                idEndpoint: "/api/id",
+                host: trackingHost,
+              }
+            : { disabled: true }
+        }
+      >
+        <SessionProvider session={pageProps.session}>
+          <LoginWrapper requiresLogin={!pageProps.publicPage}>{children}</LoginWrapper>
+        </SessionProvider>
+      </JitsuProvider>
+    </AppConfigContextProvider>
+  );
+}
+
+function configureLogging() {
+  const clientEnv = getClientEnv();
+  setGlobalLogLevel((clientEnv.NEXT_PUBLIC_LOG_LEVEL || "info") as LogLevel);
+  if (typeof window !== "undefined") {
+    window["jitsu"] = {
+      ...(window["jitsu"] || {}),
+      setDebugLog: (disable: boolean = false) => setGlobalLogLevel(disable ? "info" : "debug"),
+    };
+  }
+}
+
+const StoreLoader: React.FC<
+  PropsWithChildren<{
+    workspaceIdOrSlug: string;
+  }>
+> = ({ workspaceIdOrSlug, children }) => {
+  const configObjectsUpdater = useConfigObjectsUpdater(workspaceIdOrSlug);
+  if (configObjectsUpdater.error) {
+    log
+      .atError()
+      .log(`Can't load workspace ${JSON.stringify(configObjectsUpdater.error, null, 2)}`, configObjectsUpdater.error);
+    return (
+      <GlobalOverlay>
+        <div className="md:scale-125 mt-4 mx-4">
+          <Alert
+            type="info"
+            showIcon
+            message={<b>Can't access workspace</b>}
+            description={
+              <div className="">
+                <div className="max-w-1xl">
+                  The workspace <b>{workspaceIdOrSlug}</b> is not available or you don't have access to it. If you sure
+                  that it exists, please contact the owner.
+                </div>
+                <JitsuButton href="/workspaces" className="mt-4">
+                  Go to available workspaces
+                </JitsuButton>
+              </div>
+            }
+          />
+        </div>
+      </GlobalOverlay>
+    );
+  } else if (configObjectsUpdater.loading) {
+    return <GlobalLoader title={"Loading workspace data..."} />;
+  } else {
+    return <>{children}</>;
+  }
+};
+
+const WorkspaceWrapper: React.FC<PropsWithChildren<{}>> = ({ children }) => {
+  const router = useRouter();
+  if (router.query.workspaceId) {
+    return (
+      <StoreLoader workspaceIdOrSlug={router.query.workspaceId.toString()}>
+        <WorkspaceLoader workspaceIdOrSlug={router.query.workspaceId.toString()}>{children}</WorkspaceLoader>
+      </StoreLoader>
+    );
+  } else {
+    return <>{children}</>;
+  }
+};
+
+const WorkspaceLoader: React.FC<
+  PropsWithChildren<{
+    workspaceIdOrSlug: string;
+  }>
+> = ({ workspaceIdOrSlug, children }) => {
+  const { analytics } = useJitsu();
+  const appConfig = useAppConfig();
+  const user = useUser();
+  const router = useRouter();
+
+  const workspace = useLoadedWorkspace(workspaceIdOrSlug);
+
+  // Fetch user role for the workspace
+  const { data: users } = useQuery<{ role?: string }[]>({
+    queryKey: ["workspace-users", workspace?.id],
+    queryFn: async () => {
+      if (!workspace?.id) return [];
+      return (await get(`/api/workspace/${workspace.id}/users`)) as { role?: string }[];
+    },
+    enabled: !!workspace?.id,
+  });
+
+  // Find current user's role
+  const currentUserData = users?.find((u: any) => u.user?.id === user.internalId);
+  const role = (currentUserData?.role || "owner") as WorkspaceRoleType;
+
+  const userRole: WorkspaceRoleWithPermissions = {
+    role,
+    ...WorkspaceRolePermissions[role],
+  };
+
+  useEffect(() => {
+    if (workspace?.name) {
+      const newTitle = `Jitsu - ${workspace.name}`;
+      if (document.title !== newTitle) {
+        document.title = newTitle;
+      }
+    }
+  });
+
+  useEffect(() => {
+    if (workspace?.id) {
+      analytics.page("Workspace Page", {
+        context: { workspaceId: workspace.id, groupId: workspace.id },
+      });
+    }
+  }, [analytics, router.asPath, workspace?.id]);
+
+  /* eslint-disable react-hooks/exhaustive-deps  */
+  //user may be a new object on each render while being the same user
+  useEffect(() => {
+    if (workspace?.id && user?.internalId) {
+      analytics.identify(user.internalId, {
+        email: user.email,
+        name: user.name,
+        loginProvider: user.loginProvider,
+        externalId: user.externalId,
+        groupId: workspace.id,
+      });
+    }
+  }, [user?.internalId, analytics, workspace?.id]);
+
+  useEffect(() => {
+    if (workspace?.id) {
+      console.log("Sending page view of workspace", workspace);
+      analytics.group(workspace.id, {
+        name: workspace.name,
+        slug: workspace.slug ?? "",
+        createdAt: workspace.createdAt.toISOString(),
+      });
+    }
+  }, [analytics, workspace?.id, workspace?.name, workspace?.slug]);
+  /* eslint-enable */
+
+  return (
+    <WorkspaceContextProvider
+      workspace={{ ...workspace, slugOrId: workspace?.slug || workspace?.id }}
+      userRole={userRole}
+    >
+      <BillingProvider sendAnalytics={true} enabled={appConfig.billingEnabled}>
+        <PreviousRouteContextProvider>{children}</PreviousRouteContextProvider>
+      </BillingProvider>
+    </WorkspaceContextProvider>
+  );
+};
+
+export const ReadOnlyBanner: React.FC<{}> = () => {
+  const appConfig = useAppConfig();
+  const maintenance = appConfig.maintenance;
+  // Active maintenance (or an upcoming one with show_in_advance) takes priority.
+  if (maintenance && (maintenance.active || maintenance.show_in_advance)) {
+    // formatUtc guards against malformed ConfigMap values (returns undefined on
+    // unparseable input) so a typo doesn't crash the app shell.
+    const start = formatUtc(maintenance.planned_start);
+    const until = formatUtc(maintenance.planned_end);
+    return (
+      <div className="px-4 py-2 text-center bg-warning/20 border-b border-warning">
+        {maintenance.active
+          ? "Jitsu is in maintenance mode. Modifications are temporarily disabled."
+          : "Jitsu maintenance is scheduled"}
+        {!maintenance.active && start ? (
+          <>
+            {" "}
+            at <b>{start}</b>
+          </>
+        ) : null}
+        {until ? (
+          <>
+            {" "}
+            until <b>{until}</b>
+          </>
+        ) : null}
+        .<br />
+        {maintenance.description ||
+          (maintenance.active ? "Your data is being processed as usual, but you can't change the configuration." : "")}
+      </div>
+    );
+  }
+  return <></>;
+};
+
+export const App = ({ Component, pageProps }: AppProps) => {
+  useTitle(branding.productName);
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const startLoader = (url: string, en?: { shallow?: boolean }) => {
+    if (!en?.shallow) {
+      setLoading(true);
+    }
+  };
+  const hideLoader = (url: string, en?: { shallow?: boolean }) => {
+    if (!en?.shallow) {
+      setLoading(false);
+    }
+  };
+  useEffect(() => {
+    configureLogging();
+    router.events.on("routeChangeStart", startLoader);
+    router.events.on("routeChangeComplete", hideLoader);
+    router.events.on("routeChangeError", hideLoader);
+  }, [router.events]);
+
+  return (
+    <AntdTheme>
+      <Head>
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+        <link rel="mask-icon" href="/safari-pinned-tab.svg" color="#5bbad5" />
+      </Head>
+      <AntdModalProvider>
+        {/*{loading && <LoadingBlur />}*/}
+        <div className={`global-wrapper`}>
+          {/* QueryClientProvider must wrap ErrorBoundary: the fallback uses
+              `ErrorOrMaintenance` which calls `useApi` (React Query). If a render
+              error bubbles up to ErrorBoundary while RQ context is below it, the
+              fallback itself throws "No QueryClient set" and the user sees a
+              white screen. */}
+          <QueryClientProvider client={queryClient}>
+            <ErrorBoundary renderError={props => <ErrorOrMaintenance error={props.error} title="System error" />}>
+              <AppLoader pageProps={pageProps}>
+                <ReadOnlyBanner />
+                <WorkspaceWrapper>
+                  <Component {...pageProps} />
+                </WorkspaceWrapper>
+              </AppLoader>
+            </ErrorBoundary>
+          </QueryClientProvider>
+        </div>
+      </AntdModalProvider>
+    </AntdTheme>
+  );
+};
+
+export default App;

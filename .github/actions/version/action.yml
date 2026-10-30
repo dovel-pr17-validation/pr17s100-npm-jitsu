@@ -1,0 +1,36 @@
+name: Generate Version
+description: Generate version number based on current branch and git tags
+
+inputs:
+  version_file:
+    description: "Path to version file"
+    required: false
+    default: ".version.json"
+  channel:
+    description: "Explicit channel override (canary, beta, stable). If unset, channel is derived from the current branch."
+    required: false
+    default: ""
+
+outputs:
+  version:
+    description: "Generated version"
+    value: ${{ steps.generate.outputs.version }}
+  tag:
+    description: "Git tag for this version"
+    value: ${{ steps.generate.outputs.tag }}
+  channel:
+    description: "Detected release channel (stable, beta, or canary)"
+    value: ${{ steps.generate.outputs.channel }}
+
+runs:
+  using: composite
+  steps:
+    - name: Make script executable
+      run: chmod +x versions.sh
+      shell: bash
+    - name: Generate version
+      id: generate
+      shell: bash
+      env:
+        CHANNEL_OVERRIDE: ${{ inputs.channel }}
+      run: ./versions.sh ${{ inputs.version_file }}

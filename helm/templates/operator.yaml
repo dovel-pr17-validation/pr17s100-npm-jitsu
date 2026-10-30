@@ -1,0 +1,178 @@
+{{- if gt (int .Values.scaling.operator.replicas) 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: operator
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: operator
+spec:
+  replicas: {{ .Values.scaling.operator.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: operator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: operator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: operator
+      initContainers:
+        - name: build
+          image: golang:1.26-bookworm
+          workingDir: /src/operator
+          command:
+            - sh
+            - -c
+            - |
+              echo "Copying source..."
+              cp -r /project/bulker/* /src/
+              echo "Waiting for build lock (Go builds are serialized to avoid overloading the node)..."
+              flock /go-cache/build.lock \
+                go build -buildvcs=false -o /build/operator .
+              echo "Build complete"
+          volumeMounts:
+            - name: project
+              mountPath: /project
+              readOnly: true
+            - name: build
+              mountPath: /build
+            - name: go-cache
+              mountPath: /go-cache
+            - name: src
+              mountPath: /src
+          env:
+            - name: GOCACHE
+              value: /go-cache/build
+            - name: GOMODCACHE
+              value: /go-cache/mod
+          # Cap the build so a compile can't starve the kubelet or running
+          # pods. Builds are additionally serialized via the flock above, so
+          # at most one build is active — and it reuses the shared GOCACHE
+          # warmed by whichever build ran first. Go 1.26 is container-aware:
+          # GOMAXPROCS follows the cgroup CPU limit automatically.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "3"
+              memory: 3Gi
+      containers:
+        - name: operator
+          image: debian:bookworm-slim
+          command: ["/build/operator"]
+          ports:
+            - name: http
+              containerPort: 3052
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: jitsu-secrets
+            # Connection URLs of the in-cluster dependencies (helm-deps chart).
+            # Listed after jitsu-secrets so its keys win over any legacy URL
+            # keys there; explicit env entries below still take precedence.
+            - secretRef:
+                name: jitsu-deps-urls
+                optional: true
+          env:
+            {{- include "jitsu-dev.env" (dict "ctx" . "service" "operator"
+                  "extra" (dict "HTTP_PORT" "3052")) | nindent 12 }}
+          volumeMounts:
+            - name: build
+              mountPath: /build
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: project
+          hostPath:
+            path: {{ include "jitsu-dev.projectRoot" . }}
+            type: Directory
+        - name: build
+          emptyDir: {}
+        - name: src
+          emptyDir: {}
+        - name: go-cache
+          persistentVolumeClaim:
+            claimName: go-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: operator
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: operator
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3052
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-operator
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-operator
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: operator
+    namespace: {{ .Release.Namespace }}
+{{- end }}

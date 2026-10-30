@@ -1,0 +1,697 @@
+import {
+  AnalyticsClientEvent,
+  AnalyticsServerEvent,
+  PageReservedProps,
+  ProcessingContext,
+  ServerContextReservedProps,
+} from "@jitsu/protocols/analytics";
+import {
+  AnonymousEventsStore,
+  AnyEvent,
+  AnyProps,
+  EventContext,
+  FetchOpts,
+  FetchResponse,
+  FullContext,
+  FuncReturn,
+  FunctionLogger,
+  JitsuFunction,
+  FunctionMetrics,
+  TTLStore,
+} from "@jitsu/protocols/functions";
+import {
+  getErrorMessage,
+  getLog,
+  getThrottle,
+  int32Hash,
+  isTruish,
+  LogLevel,
+  LogMessageBuilder,
+  newError,
+  noThrottle,
+  stopwatch,
+} from "juava";
+import * as dns from "node:dns";
+import * as net from "node:net";
+import NodeCache from "node-cache";
+// Node's global fetch uses whatever undici ships with the running Node version. On
+// Node 24 that's undici 7.x, which has a keepalive connection-pool regression
+// (nodejs/undici#5910): once a server responds with `Connection: close`, every
+// later request to that host opens a fresh connection instead of reusing the pool,
+// and the stale ones are never reclaimed. Under sustained load against destinations
+// that close connections, this leaks sockets over time (rotor's active Socket/TCP
+// handle counts climb for hours, only resetting on a pod restart). Fixed upstream
+// in 8.11.0 — import undici's own fetch, pinned to that floor, instead of relying
+// on whatever the Node runtime happens to bundle.
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from "undici";
+
+// This module also runs inside the Deno-based functions-server (UDF sandbox), which
+// monkey-patches globalThis.fetch with its own tuned connection pool (Deno.createHttpClient,
+// see functions-server.ts) for proxied UDF fetch calls — but only after its own top-level
+// code runs, which happens *after* this module is imported and evaluated. So the Deno check
+// itself is safe to do once here, but globalThis.fetch must be read fresh at call time below,
+// not captured into a module-level constant — capturing it here would grab the pre-wrap
+// native fetch and silently skip the pool configuration for the module's whole lifetime.
+const isDeno = typeof (globalThis as any).Deno !== "undefined";
+const platformFetch: typeof undiciFetch = (...args) =>
+  (isDeno ? (globalThis.fetch as unknown as typeof undiciFetch) : undiciFetch)(...args);
+
+const log = getLog("functions-context");
+
+export function isPrivateIP(addr: string): boolean {
+  if (net.isIPv4(addr)) {
+    const parts = addr.split(".").map(Number);
+    return (
+      parts[0] === 10 ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) ||
+      parts[0] === 127 ||
+      parts[0] === 0 ||
+      (parts[0] === 169 && parts[1] === 254)
+    );
+  }
+  if (net.isIPv6(addr)) {
+    const normalized = addr.toLowerCase();
+    // IPv4-mapped IPv6 (::ffff:x.x.x.x) — extract the IPv4 part and check it
+    if (normalized.startsWith("::ffff:")) {
+      const v4part = normalized.slice(7);
+      if (net.isIPv4(v4part)) {
+        return isPrivateIP(v4part);
+      }
+    }
+    return (
+      normalized === "::1" ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      normalized.startsWith("fe80")
+    );
+  }
+  return false;
+}
+
+const fetchForbidLocal = isTruish(process.env.FETCH_FORBID_LOCAL);
+const fetchLocalWhitelist = process.env.FETCH_LOCAL_WHITELIST
+  ? process.env.FETCH_LOCAL_WHITELIST.split(",").map(h => h.trim().toLowerCase())
+  : [];
+const publicHostnamesCache = new NodeCache({ stdTTL: 300, checkperiod: 60, useClones: false });
+
+/**
+ * Origin of an events-log record: ids of the workspace and the source event the record was produced for.
+ * Both are optional — not every write site has them in scope
+ */
+export type EventsLogContext = {
+  workspaceId?: string;
+  messageId?: string;
+};
+
+/**
+ * Store for incoming events, destination results and function log messages
+ */
+export interface EventsStore {
+  log(connectionId: string, level: LogLevel, msg: Record<string, any>, opts?: EventsLogContext): void;
+  deadLetter(
+    workspaceId: string,
+    connectionId: string,
+    type: string,
+    payload: any,
+    error: any,
+    messageId?: string
+  ): void;
+  close(): void;
+}
+
+export const DummyEventsStore: EventsStore = {
+  log(connectionId: string, level: LogLevel, msg: Record<string, any>, opts?: EventsLogContext): void {},
+  deadLetter(
+    workspaceId: string,
+    connectionId: string,
+    type: string,
+    payload: any,
+    error: any,
+    messageId?: string
+  ): void {},
+  close(): void {},
+};
+
+export function MultiEventsStore(stores: EventsStore[]): EventsStore {
+  return {
+    log(connectionId: string, level: LogLevel, msg: Record<string, any>, opts?: EventsLogContext): void {
+      for (const store of stores) {
+        store.log(connectionId, level, msg, opts);
+      }
+    },
+    deadLetter(
+      workspaceId: string,
+      connectionId: string,
+      type: string,
+      payload: any,
+      error: any,
+      messageId?: string
+    ): void {
+      for (const store of stores) {
+        store.deadLetter(workspaceId, connectionId, type, payload, error, messageId);
+      }
+    },
+    close(): void {
+      for (const store of stores) {
+        store.close();
+      }
+    },
+  };
+}
+
+export type MetricsMeta = {
+  workspaceId: string;
+  messageId: string;
+  streamId: string;
+  destinationId: string;
+  connectionId: string;
+  functionId?: string;
+  retries?: number;
+};
+
+export type FuncChainResult = {
+  connectionId?: string;
+  events: AnyEvent[];
+  execLog: FunctionExecLog;
+};
+
+export type FunctionExecRes = {
+  receivedAt?: Date;
+  eventIndex: number;
+  event?: any;
+  metricsMeta?: MetricsMeta;
+  functionId: string;
+  error?: any;
+  dropped?: boolean;
+  ms: number;
+};
+
+export type FunctionExecLog = FunctionExecRes[];
+
+export type logType = {
+  message: string;
+  level: string;
+  timestamp: Date;
+  type: string;
+  data?: any;
+  args?: any[];
+};
+
+export interface StoreMetrics {
+  storeStatus: (namespace: string, operation: string, status: string) => void;
+  warehouseStatus: (id: string, table: string, status: string, timeMs: number) => void;
+}
+
+export interface RotorMetrics extends StoreMetrics {
+  logMetrics: (execLog: FunctionExecLog) => void;
+  close: () => void;
+}
+
+export type FetchType = (
+  url: string,
+  opts?: FetchOpts,
+  extra?: { log?: boolean; event?: AnyEvent }
+) => Promise<FetchResponse>;
+
+export type InternalFetchType = (
+  url: string,
+  opts?: FetchOpts,
+  extra?: { log?: boolean; ctx?: FunctionContext; event?: AnyEvent }
+) => Promise<FetchResponse>;
+
+export type FunctionChainContext = {
+  log: {
+    info: (ctx: FunctionContext, message: string, ...args: any[]) => void | Promise<void>;
+    warn: (ctx: FunctionContext, message: string, ...args: any[]) => void | Promise<void>;
+    debug: (ctx: FunctionContext, message: string, ...args: any[]) => void | Promise<void>;
+    error: (ctx: FunctionContext, message: string, ...args: any[]) => void | Promise<void>;
+  };
+  fetch: InternalFetchType;
+  store: TTLStore;
+  query?: (conId: string, query: string, params?: any) => Promise<any>;
+  anonymousEventsStore?: AnonymousEventsStore;
+  metrics?: FunctionMetrics;
+  connectionOptions?: any;
+};
+
+export function wrapperFunction<E extends AnyEvent = AnyEvent, P extends AnyProps = AnyProps>(
+  chainCtx: FunctionChainContext,
+  funcCtx: FunctionContext<P>,
+  jitsuFunction: JitsuFunction<E, P>
+): JitsuFunctionWrapper<E> {
+  const log = createFunctionLogger(chainCtx, funcCtx);
+  const fetchWithLog = createFetchWrapper(chainCtx, funcCtx);
+  const props = funcCtx.props;
+  const store = chainCtx.store;
+
+  return async (event: E, ctx: EventContext) => {
+    let ftch = chainCtx.fetch;
+    const fetchLogEnabled =
+      chainCtx.connectionOptions?.fetchLogLevel !== "debug" ||
+      (funcCtx.function.debugTill && funcCtx.function.debugTill > new Date());
+    if (fetchLogEnabled) {
+      ftch = async (url, opts, extra) => {
+        return fetchWithLog(url, opts, { ...extra, event });
+      };
+    }
+    const messageId = (event as any)?.messageId;
+    const fullContext: FullContext<P> = {
+      ...ctx,
+      log: messageId ? createFunctionLogger(chainCtx, { ...funcCtx, eventMessageId: messageId }) : log,
+      fetch: ftch,
+      getWarehouse: () => {
+        throw newError("Warehouse API is not available in builtin functions");
+      },
+      store,
+      props,
+    };
+    fullContext["anonymousEventsStore"] = chainCtx.anonymousEventsStore;
+    fullContext["connectionOptions"] = chainCtx.connectionOptions;
+    return jitsuFunction(event, fullContext);
+  };
+}
+
+function createFunctionLogger(chainCtx: FunctionChainContext, funcCtx: FunctionContext): FunctionLogger {
+  return {
+    info: (message: string, ...args: any) => chainCtx.log.info(funcCtx, message, ...args),
+    warn: (message: string, ...args: any) => chainCtx.log.warn(funcCtx, message, ...args),
+    debug: (message: string, ...args: any) => chainCtx.log.debug(funcCtx, message, ...args),
+    error: (message: string, ...args: any) => chainCtx.log.error(funcCtx, message, ...args),
+  };
+}
+
+function createFetchWrapper(chainCtx: FunctionChainContext, funcCtx: FunctionContext): FetchType {
+  return (url: string, opts?: FetchOpts, debug?: { event?: AnyEvent; log?: boolean }) => {
+    return chainCtx.fetch(url, opts, { log: debug?.log, ctx: funcCtx, event: debug?.event });
+  };
+}
+
+export type FunctionContext<P extends AnyProps = AnyProps> = {
+  function: {
+    id: string;
+    type: string;
+    debugTill?: Date;
+  };
+  props: P;
+  // messageId of the event being processed when the log call happens. Function chains are cached
+  // across events, so per-event ids can't be baked into makeLog — they ride on this context instead
+  eventMessageId?: string;
+};
+
+export type JitsuFunctionWrapper<E extends AnyEvent = AnyEvent> = (
+  event: E,
+  ctx: EventContext
+) => Promise<FuncReturn> | FuncReturn;
+
+type KnownEventKeys = keyof Required<AnalyticsClientEvent & ServerContextReservedProps & ProcessingContext>;
+//to make sure we
+const knownProps: Record<keyof Required<AnalyticsClientEvent & ServerContextReservedProps & ProcessingContext>, true> =
+  {
+    $table: true,
+    anonymousId: true,
+    category: true,
+    context: true,
+    event: true,
+    groupId: true,
+    messageId: true,
+    name: true,
+    previousId: true,
+    properties: true,
+    receivedAt: true,
+    requestIp: true,
+    sentAt: true,
+    timestamp: true,
+    traits: true,
+    type: true,
+    userId: true,
+    writeKey: true,
+  };
+
+const knownPageProps: Record<keyof Required<PageReservedProps>, true> = {
+  path: true,
+  host: true,
+  referrer: true,
+  referring_domain: true,
+  search: true,
+  title: true,
+  url: true,
+};
+
+// returns page name or screen name as part of properties object
+export function getPageOrScreenProps(event: AnalyticsServerEvent) {
+  if ((event.type === "page" || event.type === "screen") && event.name) {
+    return {
+      [event.type + "_name"]: event.name,
+    };
+  }
+  return {};
+}
+
+export function getEventCustomProperties(
+  event: AnalyticsServerEvent,
+  opts?: { exclude?: (obj: Record<string, any>) => void }
+) {
+  const res: Record<string, any> = {};
+  for (const prop in event) {
+    if (!knownProps[prop]) {
+      res[prop] = event[prop];
+    }
+  }
+  for (const prop in event.context.page || {}) {
+    if (!knownPageProps[prop]) {
+      res[prop] = event[prop];
+    }
+  }
+  const props = { ...res, ...(event.properties || {}), ...(event.context || {}) };
+  if (opts?.exclude) {
+    opts.exclude(props);
+  }
+  return props;
+}
+
+export function getTraits(event: AnalyticsServerEvent) {
+  return { ...(event.traits || {}), ...(event.context?.traits || {}) };
+}
+
+export function createFilter(filter: string): (eventType: string, eventName?: string) => boolean {
+  if (filter === "*") {
+    return () => true;
+  } else if (filter === "") {
+    return eventType => eventType !== "page" && eventType !== "screen";
+  } else {
+    const events = filter.split(",").map(e => e.trim());
+    return (eventType: string, eventName?: string) => {
+      return events.includes(eventType) || (!!eventName && events.includes(eventName));
+    };
+  }
+}
+
+export function eventTimeSafeMs(event: AnalyticsServerEvent) {
+  const now = Date.now();
+  const ts = event.timestamp ? new Date(event.timestamp as string).getTime() : NaN;
+  const receivedAt = event.receivedAt ? new Date(event.receivedAt as string).getTime() : NaN;
+  return Math.min(!isNaN(ts) ? ts : now, !isNaN(receivedAt) ? receivedAt : now, now);
+}
+
+export const makeLog = (
+  connectionId: string,
+  eventsStore: EventsStore,
+  repeatToLog?: boolean,
+  workspaceId?: string
+) => {
+  const logFunc = (lb: () => LogMessageBuilder, callback: (l: LogMessageBuilder) => void) => {
+    if (repeatToLog) {
+      callback(lb());
+    } else {
+      log.inDebug(callback);
+    }
+  };
+  const logContext = (ctx: FunctionContext): EventsLogContext => ({ workspaceId, messageId: ctx.eventMessageId });
+  return {
+    debug: (ctx: FunctionContext, message: any, ...args: any[]) => {
+      if (ctx.function.debugTill && ctx.function.debugTill > new Date()) {
+        const fid = ctx.function.id;
+        logFunc(log.atDebug, l => l.log(`[CON:${connectionId}]: [f:${fid}][DEBUG]: ${message}`, ...args));
+        eventsStore.log(
+          connectionId,
+          "debug",
+          {
+            type: "log-debug",
+            functionId: fid,
+            functionType: ctx.function.type,
+            message: {
+              text: message,
+              args,
+            },
+          },
+          logContext(ctx)
+        );
+      }
+    },
+    warn: (ctx: FunctionContext, message: any, ...args: any[]) => {
+      const fid = ctx.function.id;
+      logFunc(log.atWarn, l => l.log(`[CON:${connectionId}]: [f:${fid}][WARN]: ${message}`, ...args));
+      eventsStore.log(
+        connectionId,
+        "warn",
+        {
+          type: "log-warn",
+          functionId: fid,
+          functionType: ctx.function.type,
+          message: {
+            text: message,
+            args,
+          },
+        },
+        logContext(ctx)
+      );
+    },
+    error: (ctx: FunctionContext, message: any, ...args: any[]) => {
+      const fid = ctx.function.id;
+      eventsStore.log(
+        connectionId,
+        "error",
+        {
+          type: "log-error",
+          functionId: fid,
+          functionType: ctx.function.type,
+          message: {
+            text: message,
+            args,
+          },
+        },
+        logContext(ctx)
+      );
+      logFunc(log.atError, l => {
+        if (args?.length > 0) {
+          const last = args[args.length - 1];
+          if (last.stack) {
+            l.withCause(last);
+            args = args.slice(0, args.length - 1);
+          }
+        }
+        l.log(`[CON:${connectionId}]: [f:${fid}][ERROR]: ${message}`, ...args);
+      });
+    },
+    info: (ctx: FunctionContext, message: any, ...args: any[]) => {
+      const fid = ctx.function.id;
+      logFunc(log.atInfo, l => l.log(`[CON:${connectionId}]: [f:${fid}][INFO]: ${message}`, ...args));
+      eventsStore.log(
+        connectionId,
+        "info",
+        {
+          type: "log-info",
+          functionId: fid,
+          functionType: ctx.function.type,
+          message: {
+            text: message,
+            args,
+          },
+        },
+        logContext(ctx)
+      );
+    },
+  };
+};
+
+/**
+ * Create a Response-like wrapper backed by a fully consumed byte buffer.
+ * Body methods (text/json/arrayBuffer/blob) can be called multiple times.
+ */
+function createBufferedResponse(original: Response, body: Uint8Array): Response {
+  let textCache: string | undefined;
+  const getText = () => {
+    if (textCache === undefined) {
+      textCache = new TextDecoder().decode(body);
+    }
+    return textCache;
+  };
+  return {
+    status: original.status,
+    statusText: original.statusText,
+    headers: original.headers,
+    ok: original.ok,
+    url: original.url,
+    type: original.type,
+    redirected: original.redirected,
+    bodyUsed: true,
+    get body() {
+      return getText() as any;
+    },
+    text: () => Promise.resolve(getText()),
+    json: () => Promise.resolve(JSON.parse(getText())),
+    arrayBuffer: () => Promise.resolve(body.buffer),
+    blob: () => Promise.resolve(new Blob([body])),
+    bytes: () => Promise.resolve(body),
+    clone: () => createBufferedResponse(original, body),
+    formData: () => {
+      throw new Error("formData() not supported on buffered response");
+    },
+  } as Response;
+}
+
+export const makeFetch = (
+  connectionId: string,
+  eventsStore: EventsStore,
+  logLevel: "info" | "debug",
+  fetchTimeoutMs: number = 2000,
+  workspaceId?: string
+) => {
+  const throttle = connectionId === "clke5lrfm0000ii0gahryc37d-wbyo-5jyq-KIMXwt" ? getThrottle(5000) : noThrottle();
+
+  async function isPublic(hostname: string) {
+    const cached = publicHostnamesCache.get(hostname);
+    if (typeof cached !== "undefined") {
+      return cached as boolean;
+    }
+    const addresses = await dns.promises.lookup(hostname, { all: true });
+    if (addresses.length === 0) {
+      publicHostnamesCache.set(hostname, false);
+      return false;
+    }
+    for (const addr of addresses) {
+      if (isPrivateIP(addr.address)) {
+        publicHostnamesCache.set(hostname, false);
+        return false;
+      }
+    }
+    publicHostnamesCache.set(hostname, true);
+    return true;
+  }
+
+  return async (
+    url: string,
+    init?: FetchOpts,
+    extra?: { log?: boolean; ctx?: FunctionContext; event?: AnyEvent }
+  ): Promise<Response> => {
+    //capture execution time
+    const sw = stopwatch();
+    const ctx = extra?.ctx?.function;
+    const id = ctx?.id || "unknown";
+    const type = ctx?.type || "unknown";
+    const logCtx: EventsLogContext = {
+      workspaceId,
+      messageId: (extra?.event as any)?.messageId || extra?.ctx?.eventMessageId,
+    };
+    const logEnabled = logLevel === "info" || (ctx?.debugTill && ctx?.debugTill > new Date());
+    const logToRedis = typeof extra?.log === "boolean" ? extra.log : true;
+    const baseInfo =
+      logEnabled && logToRedis
+        ? {
+            functionId: id,
+            functionType: type,
+            type: "http-request",
+            url: url,
+            method: init?.method || "GET",
+            body: init?.body,
+            headers: init?.headers ? hideSensitiveHeaders(init.headers) : undefined,
+            event: extra?.event || {},
+          }
+        : undefined;
+
+    let fetchResult: any = undefined;
+    try {
+      const host = new URL(url).hostname; //this will throw if url is invalid
+      if (fetchForbidLocal && !fetchLocalWhitelist.includes(host.toLowerCase()) && !(await isPublic(host))) {
+        throw newError(`fetch failed`);
+      }
+      const throttleValue = throttle.throttle();
+      if (throttleValue > 0 && Math.random() < throttleValue) {
+        const e = new Error(`Fetch request throttled because of timeout rate: ${throttleValue}`);
+        e.name = "ThrottleError";
+        throw e;
+      }
+      const internalInit: UndiciRequestInit = {
+        ...init,
+        keepalive: true,
+        signal: AbortSignal.timeout(fetchTimeoutMs),
+      };
+      fetchResult = await platformFetch(url, internalInit);
+      throttle.success();
+    } catch (err: any) {
+      if (err.name === "TimeoutError") {
+        throttle.fail();
+        err = newError(`Fetch request exceeded timeout ${fetchTimeoutMs}ms and was aborted`, err);
+      } else if (err.name !== "ThrottleError") {
+        // we throttle only timeout errors. all other cases considered as success here
+        throttle.success();
+      }
+      if (logEnabled) {
+        const elapsedMs = sw.elapsedMs();
+        if (logToRedis) {
+          eventsStore.log(
+            connectionId,
+            logLevel,
+            { ...baseInfo, error: getErrorMessage(err), elapsedMs: elapsedMs },
+            logCtx
+          );
+        }
+        log.inDebug(l =>
+          l.log(
+            `[CON:${connectionId}]: [f:${id}][ERROR][FETCH]: ${url} Error: ${getErrorMessage(
+              err
+            )} ElapsedMs: ${elapsedMs}`
+          )
+        );
+      }
+      throw err;
+    }
+
+    // Fully consume the response body to prevent resource leaks
+    const bodyBytes = await fetchResult.bytes();
+    const buffered = createBufferedResponse(fetchResult, bodyBytes);
+
+    if (logEnabled) {
+      const elapsedMs = sw.elapsedMs();
+      const respText = await trimResponse(buffered);
+      if (logToRedis) {
+        eventsStore.log(
+          connectionId,
+          logLevel,
+          {
+            ...baseInfo,
+            status: fetchResult.status,
+            statusText: fetchResult.statusText,
+            elapsedMs: elapsedMs,
+            response: tryJson(respText),
+          },
+          logCtx
+        );
+      }
+      if (fetchResult.status >= 300) {
+        log.inDebug(l =>
+          l.log(
+            `[CON:${connectionId}]: [f:${id}][ERROR][FETCH]: ${url} Status: ${fetchResult.status} Response: ${respText} ElapsedMs: ${elapsedMs}`
+          )
+        );
+      }
+    }
+
+    return buffered;
+  };
+};
+
+function hideSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    result[k] = k.toLowerCase().includes("authorization") || k.toLowerCase().includes("token") ? "*****" : v;
+  }
+  return result;
+}
+
+async function trimResponse(fetchResult: Response, maxLen: number = 1000): Promise<any> {
+  const text = await fetchResult.text();
+  if (text.length > maxLen) {
+    return `${text.substring(0, maxLen)} ... [truncated, length: ${text.length}]`;
+  }
+  return text;
+}
+
+function tryJson(text: string, maxLen: number = 1000): any {
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return text;
+  }
+}

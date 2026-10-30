@@ -1,0 +1,581 @@
+import { z } from "zod";
+
+import { eventsParamDescription } from "./functions/lib/metadata";
+export const FacebookConversionApiCredentials = z.object({
+  pixelId: z
+    .string()
+    .optional()
+    .describe(
+      "Pixel / Dataset ID. Required for ordinary event connections. Reverse ETL conversions configure their data source on the sync; audiences do not use a pixel."
+    ),
+  accessToken: z
+    .string()
+    .describe(
+      "Meta Access Token. For Reverse ETL, use a system-user token with access to the selected ad account or pixel/dataset."
+    ),
+  actionSource: z
+    .enum(["email", "website", "app", "phone_call", "chat", "physical_store", "system_generated", "other"])
+    .default("website")
+    .describe("Action Source"),
+  events: z.string().optional().default("").describe(eventsParamDescription),
+  phoneFieldName: z
+    .string()
+    .optional()
+    .default("")
+    .describe(
+      "Name of the field in the event user traits that contains the phone number. Expected format could be <a href='https://en.wikipedia.org/wiki/E.164' target='_blank' rel='noreferrer noopener'>E.164</a> or international format. If empty, phone number hash will not be sent."
+    ),
+});
+
+export const FacebookConversionApiCredentialsUi = {
+  accessToken: {
+    password: true,
+  },
+};
+
+export type FacebookConversionApiCredentials = z.infer<typeof FacebookConversionApiCredentials>;
+
+function isSupportedWebhookUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.username === "" && url.password === "";
+  } catch {
+    return false;
+  }
+}
+
+export const WebhookDestinationConfig = z.object({
+  url: z
+    .string()
+    .url()
+    .refine(isSupportedWebhookUrl, "Webhook URL must use HTTP or HTTPS without embedded credentials")
+    .describe("Webhook URL"),
+  method: z
+    .enum(["GET", "POST", "PUT", "DELETE"])
+    .default("POST")
+    .describe("HTTP method. Can be <code>GET</code>, <code>POST</code>, <code>PUT</code>, <code>DELETE</code>"),
+  headers: z.array(z.string()).optional().describe("List of headers in format <code>key: value</code>"),
+  customPayload: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("Enable custom payload. If disabled, the event payload will be sent as is."),
+  payload: z
+    .string()
+    .optional()
+    .describe(
+      "Payload Template::Template for the webhook payload. The following macros are supported:<ul><li><code>{{ EVENT }}</code> - event json object for stream mode or batches with size=1</li><li><code>{{ EVENTS }}</code> - for batch mode - json array of events</li><li><code>{{ EVENTS_COUNT }}</code> - count of events in batch</li><li><code>{{ NAME }}</code> - event name</li><li><code>{{ env.VAR_NAME }}</code> - value of VAR_NAME environment variable</li></ul>"
+    ),
+  signatureMethod: z
+    .enum(["none", "hmac", "ed25519"])
+    .optional()
+    .default("none")
+    .describe(
+      "Signature Method::How outgoing requests are signed so your endpoint can verify them.<ul><li><code>none</code> — requests are not signed.</li><li><code>hmac</code> — symmetric HMAC-SHA256 with a shared secret (like Stripe/GitHub). Simple, but anyone who can verify can also forge, so only use it for endpoints you fully trust.</li><li><code>ed25519</code> — asymmetric signature. Jitsu signs with a private key; your endpoint verifies with the public key and cannot forge messages. Prefer this when many or untrusted endpoints receive the webhook.</li></ul><b>Note:</b> signing applies to <b>stream</b>-mode delivery only. In <b>batch</b> mode events are delivered by Bulker and are <b>not</b> signed — use stream mode if you need signed webhooks."
+    ),
+  signatureSecret: z
+    .string()
+    .optional()
+    .describe(
+      "Signing Secret::Shared secret for <code>HMAC-SHA256</code> signing (symmetric — there is no key pair). Put the <b>same</b> value here and in your receiving endpoint. Generate a random one with <code>openssl rand -hex 32</code> (any high-entropy string of 32+ bytes works). To verify a request, your endpoint recomputes the HMAC over the signed payload with this secret and compares the hex digest to the <code>Jitsu-Signature</code> header using a constant-time comparison. Keep it secret."
+    ),
+  signaturePrivateKey: z
+    .string()
+    .optional()
+    .describe(
+      "Private Key (PEM)::Ed25519 private key used to sign requests. Generate a key pair:<br/><code>openssl genpkey -algorithm ed25519 -out jitsu_private.pem</code><br/><code>openssl pkey -in jitsu_private.pem -pubout -out jitsu_public.pem</code><br/>Paste the contents of <code>jitsu_private.pem</code> here and install <code>jitsu_public.pem</code> on your endpoint. To verify a request, your endpoint checks the <code>Jitsu-Signature</code> header (a hex Ed25519 signature) against the signed payload using the public key. Jitsu holds only the private key — keep it secret; the public key is safe to distribute."
+    ),
+  signatureHeader: z
+    .string()
+    .regex(
+      /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/,
+      "Must be a valid HTTP header name (letters, digits, and !#$%&'*+-.^_`|~ only)"
+    )
+    .optional()
+    .default("Jitsu-Signature")
+    .describe("Signature Header::Name of the header carrying the signature. Only used when signing is enabled."),
+  signatureIncludeTimestamp: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      "Replay Protection::When enabled (recommended), the request timestamp (unix seconds) is folded into the signed payload — the signature covers <code>&lt;timestamp&gt;.&lt;body&gt;</code> — and sent in a companion <code>&lt;Signature Header&gt;-Timestamp</code> header. Your endpoint can then reject requests with an old timestamp to block replays of a captured, still-valid request. When disabled, only the raw body is signed and no timestamp header is sent: simpler to verify, but a captured request stays valid forever. Only used when signing is enabled."
+    ),
+});
+
+export type WebhookDestinationConfig = z.infer<typeof WebhookDestinationConfig>;
+
+const MixpanelServiceAccountDocumentation =
+  'See <a href="https://developer.mixpanel.com/reference/service-accounts">how to create service account</a>';
+
+export const IntercomDestinationCredentials = z.object({
+  accessToken: z
+    .string()
+    .describe(
+      "Intercom Access Token. You should first create an app in Intercom Developer Hub, and then generate an access token in the app settings. See <a href='https://developers.intercom.com/docs/build-an-integration/getting-started/' target='_blank' rel='noreferrer noopener'>a detailed guide</a>"
+    ),
+  updateLastSeenOnEveryEvent: z
+    .boolean()
+    .optional()
+    .describe(
+      "By default, the last seen property will be updated only on .identify() calls. If enabled, the property will be updated on every event. However, enabling this option may lead to higher API usage."
+    ),
+});
+
+export type IntercomDestinationCredentials = z.infer<typeof IntercomDestinationCredentials>;
+
+export const MixpanelCredentials = z.object({
+  dataResidency: z.enum(["US", "EU"]).optional().default("US"),
+  simplifiedIdMerge: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      `Simplified Identity Merge::Use Mixpanel <a href="https://docs.mixpanel.com/docs/tracking-methods/identifying-users">Simplified Identity Merge</a> feature.<br/>Enable this option if your Mixpanel project has the corresponding <a href="https://docs.mixpanel.com/docs/tracking-methods/identifying-users#how-do-i-switch-between-the-simplified-and-original-api">feature enabled</a>.<br/><b>Using this feature is highly recommended to achieve better quality Identity Merge</b>`
+    ),
+  projectId: z
+    .string()
+    .describe(
+      'Project id can be found in the <a href="https://help.mixpanel.com/hc/en-us/articles/115004490503-Project-Settings">project settings</a>'
+    ),
+  projectToken: z
+    .string()
+    .describe('See <a href="https://developer.mixpanel.com/reference/project-token">how to obtain project secret</a>'),
+  //apiSecret: z.string(),
+  serviceAccountUserName: z.string().describe(MixpanelServiceAccountDocumentation),
+  serviceAccountPassword: z.string().describe(MixpanelServiceAccountDocumentation),
+  sendPageEvents: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("If enabled, all page view events will be sent to Mixpanel."),
+  sendIdentifyEvents: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "If enabled, any identify() call will send an Identify event to Mixpanel in addition to the profile update"
+    ),
+  enableGroupAnalytics: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Mixpanel Group Analytics allows behavioral data analysis at a customized group level. Group Analytics is available as an add-on package to customers on <a href='https://mixpanel.com/pricing/' target='_blank' rel='noreferrer noopener'>Growth and Enterprise plans.</a>"
+    ),
+  filterBotTraffic: z.boolean().optional().default(true).describe("Don't send traffic from known bots to Mixpanel"),
+  groupKey: z
+    .string()
+    .optional()
+    .default("$group_id")
+    .describe(
+      "Group Key for Mixpanel Group Analytics. Make sure that Group Key in <a href='https://mixpanel.com/report' target='_blank' rel='noreferrer noopener'>Mixpanel project settings</a> matches the provided value."
+    ),
+  enableAnonymousUserProfiles: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("If enabled, anonymous users will be tracked in Mixpanel"),
+});
+export type MixpanelCredentials = z.infer<typeof MixpanelCredentials>;
+
+export const MixpanelCredentialsUi: Partial<
+  Record<keyof MixpanelCredentials, { documentation?: string; password?: boolean; hidden?: boolean }>
+> = {
+  serviceAccountPassword: {
+    password: true,
+  },
+};
+
+export const JuneCredentials = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      `API Key::To get or create an API Key, go to workspace's "Settings & integrations" > Integrations > June SDK`
+    ),
+  enableAnonymousUserProfiles: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("If enabled, anonymous users will be tracked in June"),
+});
+export type JuneCredentials = z.infer<typeof JuneCredentials>;
+
+export const ResendCredentials = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      `API Key::Create an API key in the Resend dashboard under "API Keys". It needs write access to Contacts. The key starts with "re_".`
+    ),
+  audiences: z
+    .string()
+    .optional()
+    .describe(
+      `Audiences::Comma-separated list of Resend audience names to add identified contacts to (e.g. <code>Customers, Beta</code>). Names are resolved automatically — any that don't exist yet are created. Leave empty to add contacts without an audience. Can be overridden per event with a <code>resendAudiences</code> trait. Membership is reconciled to match the list: audiences the connector previously added that are no longer listed get removed.`
+    ),
+  resolveEmailFromUserId: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      `Resolve email from userId::Resend identifies contacts by email only — it has no notion of a userId. When enabled, every <code>identify()</code> caches a userId → email mapping so later <code>track</code>/<code>page</code>/<code>group</code> events that carry only a userId can still update the matching contact. When disabled (default), only events that carry an email directly are matched; events with just a userId are skipped.`
+    ),
+  apiBase: z
+    .string()
+    .optional()
+    .describe(
+      `API Base URL::Override the Resend API base URL (defaults to https://api.resend.com). For testing or proxying.`
+    ),
+});
+export type ResendCredentials = z.infer<typeof ResendCredentials>;
+
+export const ResendCredentialsUi: Partial<
+  Record<keyof ResendCredentials, { documentation?: string; password?: boolean; hidden?: boolean }>
+> = {
+  apiKey: {
+    password: true,
+  },
+  apiBase: {
+    hidden: true,
+  },
+};
+
+export const SendgridCredentials = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      `API Key::Create an API key in the SendGrid dashboard under Settings > API Keys. It needs "Marketing" permissions (Read/Write access to Marketing Contacts).`
+    ),
+  lists: z
+    .string()
+    .optional()
+    .describe(
+      `Lists::Comma-separated list of SendGrid marketing list names to add identified contacts to (e.g. <code>Customers, Beta</code>). Names are resolved automatically — any that don't exist yet are created. Leave empty to add contacts without a list. Can be overridden per event with a <code>sendgridLists</code> trait. Membership is reconciled to match the list: lists the connector previously added that are no longer listed get removed.`
+    ),
+  region: z
+    .enum(["Global", "EU"])
+    .optional()
+    .default("Global")
+    .describe(
+      `Data Residency::Select "EU" if your SendGrid account uses EU data residency (requests go to api.eu.sendgrid.com). Otherwise leave as "Global" (api.sendgrid.com).`
+    ),
+  resolveEmailFromUserId: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      `Resolve email from userId::SendGrid identifies contacts by email. When enabled, every <code>identify()</code> caches a userId → email mapping so later <code>track</code>/<code>page</code>/<code>group</code> events that carry only a userId can still update the matching contact. When disabled (default), only events that carry an email directly are matched.`
+    ),
+  apiBase: z
+    .string()
+    .optional()
+    .describe(
+      `API Base URL::Override the SendGrid API base URL (defaults to the Global/EU host from Data Residency). For testing or proxying.`
+    ),
+});
+export type SendgridCredentials = z.infer<typeof SendgridCredentials>;
+
+export const SendgridCredentialsUi: Partial<
+  Record<keyof SendgridCredentials, { documentation?: string; password?: boolean; hidden?: boolean }>
+> = {
+  apiKey: {
+    password: true,
+  },
+  apiBase: {
+    hidden: true,
+  },
+};
+
+export const SalesforceCredentials = z.object({
+  authorized: z.boolean().optional().default(false),
+  oauthIntegrationId: z.string().optional().default("jitsu-cloud-dst-salesforce"),
+  oauthConnectionId: z.string().optional(),
+  isSandbox: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Sandbox Instance::You can log in to a sandbox by switching the login form to use Custom Domain, and providing the login URL of your sandbox, e.g.: <b>MyDomainName--SandboxName.sandbox.my.salesforce.com</b><br/><br/>Alternatively, you can use the general login form by appending the sandbox name to your Salesforce username. For example, if the production username is <b>user@example.com</b> and the sandbox is named <b>sndbx</b>, the sandbox username would be: <b>user@example.com.sndbx</b><br/><br/>If you are already authenticated, please <b>Re-Sign In</b> with your sandbox username."
+    ),
+});
+export type SalesforceCredentials = z.infer<typeof SalesforceCredentials>;
+
+export const BrazeCredentials = z.object({
+  apiKey: z.string().describe(`API Key::Created under Developer Console in the Braze Dashboard.`),
+  endpoint: z
+    .enum([
+      "US-01 : dashboard-01.braze.com",
+      "US-02 : dashboard-02.braze.com",
+      "US-03 : dashboard-03.braze.com",
+      "US-04 : dashboard-04.braze.com",
+      "US-05 : dashboard-05.braze.com",
+      "US-06 : dashboard-06.braze.com",
+      "US-07 : dashboard-07.braze.com",
+      "US-08 : dashboard-08.braze.com",
+      "US-09 : dashboard-09.braze.com",
+      "EU-01 : dashboard-01.braze.eu",
+      "EU-02 : dashboard-02.braze.eu",
+    ])
+    .optional()
+    .default("US-01 : dashboard-01.braze.com")
+    .describe(
+      "Your Braze REST endpoint. <a target='_blank' rel='noopener noreferrer' href='https://www.braze.com/docs/api/basics/#endpoints'>More details</a>"
+    ),
+  appId: z
+    .string()
+    .optional()
+    .describe(
+      "App ID::The app identifier used to reference specific Apps in requests made to the Braze API. Created under Developer Console in the Braze Dashboard."
+    ),
+  useJitsuAnonymousIdAlias: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Use Anonymous Id Alias::Use Jitsu <code>anonymousId</code> as an alias for identified and anonymous profiles. Enables support for anonymous (alias-only) profiles."
+    ),
+  sendPageEvents: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("Send <code>page</code> and <code>screen</code> events as Braze Custom Events"),
+});
+export type BrazeCredentials = z.infer<typeof BrazeCredentials>;
+
+const SEGMENT_API_BASES = [
+  "https://api.segmentapis.com/v1",
+  "https://eu1.api.segmentapis.com/v1",
+  "https://api.segment.io/v1",
+] as const;
+
+export const SegmentCredentials = z.object({
+  apiBase: z.enum(SEGMENT_API_BASES).default(SEGMENT_API_BASES[0]).describe("API Base::Segment API Base"),
+  writeKey: z
+    .string()
+    .describe(
+      `To get an API Key you need to add the HTTP API source to your Segment workspace. Write Key can be found on the HTTP API source Overview page.`
+    ),
+});
+export type SegmentCredentials = z.infer<typeof SegmentCredentials>;
+
+export const POSTHOG_DEFAULT_HOST = "https://app.posthog.com";
+
+export const PosthogDestinationConfig = z.object({
+  key: z
+    .string()
+    .describe(
+      "Project API Key::Posthog Project API Key. Can be found in <a target='_blank' rel='noopener noreferrer' href='https://app.posthog.com/project/settings'>Project Settings</a>"
+    ),
+  host: z.string().optional().default(POSTHOG_DEFAULT_HOST).describe("Posthog host"),
+  enableGroupAnalytics: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Group analytics is a powerful feature in PostHog that allows you to perform analytics on entities other than single users. Group Analytics is not available on the open-source or free cloud plan. <a href='https://posthog.com/pricing' target='_blank' rel='noreferrer noopener'>Learn more.</a>"
+    ),
+  groupType: z
+    .string()
+    .optional()
+    .default("company")
+    .describe(
+      "Group type is the abstract type of whatever our group represents (e.g. company, team, chat, post, etc.). <a href='https://posthog.com/docs/getting-started/group-analytics#groups-vs-group-types' target='_blank' rel='noreferrer noopener'>Groups vs. group types.</a>"
+    ),
+  sendAnonymousEvents: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("Send events from anonymous users. If disabled, only events from identified users will be tracked."),
+  enableAnonymousUserProfiles: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Enable Anonymous Person Profiles::Create <a href='https://posthog.com/docs/getting-started/person-properties' target='_blank' rel='noreferrer noopener'>Person profiles</a> for anonymous users. If disabled, only identified users will have profiles."
+    ),
+});
+
+export const PosthogDestinationConfigUi: Partial<
+  Record<keyof PosthogDestinationConfig, { correction?: any; hidden?: any }>
+> = {
+  sendAnonymousEvents: {
+    // assumes value of this freshly added property from the value of the `enableAnonymousUserProfiles` property
+    correction: obj =>
+      typeof obj?.sendAnonymousEvents === "undefined" ? obj?.enableAnonymousUserProfiles : obj?.sendAnonymousEvents,
+  },
+  enableAnonymousUserProfiles: {
+    hidden: obj =>
+      typeof obj?.sendAnonymousEvents === "undefined" ? !obj.enableAnonymousUserProfiles : !obj.sendAnonymousEvents,
+  },
+};
+
+export type PosthogDestinationConfig = z.infer<typeof PosthogDestinationConfig>;
+
+export const AmplitudeDestinationConfig = z.object({
+  key: z.string().describe("Project API Key::Amplitude Project API Key."),
+  enableGroupAnalytics: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Build an analysis around aggregated units of measure like accounts, charts, or order IDs. Requires The Amplitude Accounts add-on. <a href='https://help.amplitude.com/hc/en-us/articles/115001765532-Account-level-reporting-in-Amplitude' target='_blank' rel='noreferrer noopener'>Learn more.</a>"
+    ),
+  groupType: z
+    .string()
+    .optional()
+    .default("company")
+    .describe(
+      "Group type is the abstract type of whatever our group represents (e.g. accounts, charts, or order IDs)."
+    ),
+  enableAnonymousUserProfiles: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("If enabled, anonymous users will be tracked in Amplitude"),
+  dataResidency: z.enum(["US", "EU"]).optional().default("US"),
+  sessionWindow: z.number().optional().default(30).describe("Session window in minutes"),
+  minIdLength: z
+    .number()
+    .optional()
+    .default(5)
+    .describe("Minimum ID Length::Overrides the Amplitude's default minimum ID length of 5 characters."),
+});
+
+export type AmplitudeDestinationConfig = z.infer<typeof AmplitudeDestinationConfig>;
+
+export const MongodbDestinationConfig = z.object({
+  url: z.string().optional(),
+  protocol: z
+    .enum(["mongodb", "mongodb+srv"])
+    .default("mongodb")
+    .describe(
+      "MongoDB protocol. <code>mongodb</code> or <code>mongodb+srv</code>. For Atlas use <code>mongodb+srv</code>"
+    ),
+  hosts: z
+    .array(z.string())
+    .optional()
+    .describe("MongoDB hosts with port (e.g. <code>localhost:27017</code>). One on each line"),
+  username: z.string().describe("MongoDB username"),
+  password: z.string().describe("MongoDB password"),
+  database: z.string().describe("MongoDB database"),
+  collection: z.string().describe("MongoDB collection"),
+
+  options: z.object({}).catchall(z.string().default("")).optional().describe("Additional MongoDB connection options."),
+});
+
+export const MongodbDestinationConfigUi: Partial<
+  Record<
+    keyof MongodbDestinationConfig,
+    {
+      documentation?: string;
+      editor?: string;
+      hidden?: boolean;
+      password?: boolean;
+    }
+  >
+> = {
+  hosts: {
+    editor: "StringArrayEditor",
+  },
+  url: {
+    hidden: true,
+  },
+  password: {
+    password: true,
+  },
+};
+
+export type MongodbDestinationConfig = z.infer<typeof MongodbDestinationConfig>;
+
+export const Ga4Credentials = z.object({
+  apiSecret: z
+    .string()
+    .describe(
+      "An <code>API SECRET</code> generated in the Google Analytics UI. To create a new secret, navigate to:<br/>" +
+        "<b>Admin > Data Streams > choose your stream > Measurement Protocol API Secrets > Create</b>"
+    ),
+  measurementId: z
+    .string()
+    .describe(
+      "The measurement ID associated with a stream.<br/><b>For Web:</b> found in the Google Analytics UI under: " +
+        "<b>Admin > Data Streams > choose your stream > Measurement ID</b><br/><b>For Apps</b>: the Firebase App ID, found in the Firebase console under: <b>Project Settings > General > Your Apps > App ID</b>"
+    ),
+  events: z.string().optional().default("").describe(eventsParamDescription),
+});
+export type Ga4Credentials = z.infer<typeof Ga4Credentials>;
+
+export { GoogleAdsCredentials, GoogleAdsCredentialsUi } from "./functions/google-ads/credentials";
+
+export const HubspotCredentials = z.object({
+  accessToken: z
+    .string()
+    .describe(
+      [
+        "To obtain an access secret, go to <b>Settings » Account Setup » Private Apps</b>, create a new private app copy the <b>Access token</b>. See <a href='https://developers.hubspot.com/docs/api/private-apps'>detailed guide</a>.",
+        "Please make sure to grant an application all read and write permissions under CRM section",
+      ].join("\n")
+    ),
+  sendPageViewEvents: z
+    .boolean()
+    .optional()
+    .describe("When enabled, Jitsu will send page view events to hubspot (only events with a known email)"),
+  autoCreateCustomProperties: z
+    .boolean()
+    .optional()
+    .describe(
+      "When enabled, Jitsu will automatically create HubSpot <a href='https://knowledge.hubspot.com/properties/create-and-edit-properties'>custom properties</a> for Contacts and Companies to capture every new trait. Otherwise, only known properties are sent."
+    ),
+});
+
+export type HubspotCredentials = z.infer<typeof HubspotCredentials>;
+
+export const StatsigDestinationConfig = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      "Server Secret Key::Server Secret Key. Server Secret Keys can be created in <a target='_blank' rel='noopener noreferrer' href='https://console.statsig.com/api_keys'>Statsig Console → Project Settings → Keys & Environments</a>."
+    ),
+  enableAnonymousUserProfiles: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("If enabled, anonymous users (without userId) will be tracked in Statsig using their anonymousId"),
+  sendPageEvents: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("If enabled, page and screen view events will be sent to Statsig"),
+  segmentCompatibility: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Segment Compatibility Mode::When enabled, customIDs and custom properties will only be populated from <code>statsigCustomIDs</code> and <code>statsigCustom</code> arrays in event properties or traits, following <a target=\'_blank\' rel=\'noopener noreferrer\' href=\'https://docs.statsig.com/integrations/data-connectors/segment#manual-configuration\'>Segment\'s integration pattern</a>. Arrays should be in key-value pair format: <code>["key1", "value1", "key2", "value2"]</code>.'
+    ),
+  includeContextInMetadata: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Include Context in Metadata::When enabled, event context properties (page, screen, device, etc.) will be included in event metadata."
+    ),
+  environment: z
+    .string()
+    .optional()
+    .describe(
+      "Environment Tier::Statsig environment tier (e.g., production, staging, development). This will be used to segment data by environment in Statsig."
+    ),
+});
+
+export type StatsigDestinationConfig = z.infer<typeof StatsigDestinationConfig>;
+
+export const StatsigDestinationConfigUi: Partial<
+  Record<keyof StatsigDestinationConfig, { password?: boolean; hidden?: boolean | ((obj: any) => boolean) }>
+> = {
+  apiKey: {
+    password: true,
+  },
+  includeContextInMetadata: {
+    hidden: (obj: any) => obj.segmentCompatibility === true,
+  },
+};

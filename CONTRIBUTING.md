@@ -1,0 +1,236 @@
+# Repository Layout
+
+This is a monorepo spanning Go and TypeScript.
+
+```
+bulker/            Go services
+  bulkerapp/         Bulker — warehouse ingestion service
+  ingest/            HTTP ingest endpoint
+  sync-controller/   Connector sync orchestration
+  bulkerlib/         Core ingestion library
+  connectors/        Warehouse connectors (ClickHouse, BigQuery, Redshift, Snowflake, S3, GCS, …)
+
+services/
+  rotor/             Event routing, transformation, function execution
+
+webapps/
+  console/           Admin UI (Next.js), Management API, MCP server
+
+libs/
+  jitsu-js/          Browser + Node.js SDK (@jitsu/js)
+  jitsu-react/       React bindings (@jitsu/jitsu-react)
+  functions/         Functions runtime (@jitsu/functions-lib)
+  juava/             Shared TypeScript utilities
+
+cli/jitsu-cli/     Developer CLI (jitsu-cli on npm)
+types/protocols/   Shared TypeScript protocols (@jitsu/protocols)
+helm/              Helm chart
+docker/            Docker Compose setup (deprecated)
+```
+
+# Prerequisites
+
+- `node: >=22`
+- `npx`
+- `pnpm: >= 10`
+- `docker: >= 19.03.0`
+- `go: 1.26` — for the Go services; the repo uses Go workspaces via `go.work`
+
+# Commands
+
+- `pnpm install` - Install dependencies
+- `pnpm codegen` - Generate the Prisma client + zod schemas. Required once after a fresh checkout
+  (or a new worktree) before anything else will build
+- `pnpm build` - Build the project
+  - `pnpm build:turbo` - Same, orchestrated by Turbo
+- `pnpm format` - Apply prettier to the project, only to changed files
+  - `pnpm format:check` - Check if prettier needs to be applied, check only changed files
+  - `pnpm format:check:all` - Check if prettier needs to be applied. Check all files
+  - `pnpm format:all` - Same as `pnpm format`, but check all files, regardless of changes
+- `pnpm typecheck` - Run typecheck
+  - `pnpm typecheck:turbo` - Same, orchestrated by Turbo
+- `pnpm lint` - Run linter
+- `pnpm test` - Run tests
+- `pnpm console:dev` - Run just the console
+
+For the Go services, inside `bulker/`:
+
+```bash
+go build ./...
+go test ./...
+```
+
+# Local Dev Env
+
+Run 
+ * `docker compose -f ./docker/docker-compose.yml up --force-recreate` to start all dependencies required to run Jitsu. 
+ * `docker compose -f ./docker/docker-compose.yml up --profile jitsu-services-dev --force-recreate` - to run dependencies + all Jitsu services
+in a hot reload mode, see `docker/README.md`
+
+# Environment variables
+
+Every node process spawned by a pnpm script auto-loads two layered `.env.local` files
+(later wins; existing `process.env` always wins over both, missing files skipped silently):
+
+1. `~/.jitsu/.env.local` — shared across all worktrees of all branches (Firebase, Stripe,
+   OIDC, GitHub OAuth — anything that doesn't change per branch).
+2. `<repo>/.env.local` — per-worktree (`DATABASE_URL`, `NEXTAUTH_URL`, `AUTH_COOKIE_DOMAIN`,
+   anything that should differ between two worktrees of two PRs).
+
+**No wrapper.** `node --inspect script.js` and your debugger attach to the script's own
+process directly — there's no `dotenv-cli` parent in the tree.
+
+`.env.example` documents the variables the apps expect. Runtime defaults belong in code
+(`process.env.FOO ?? "default"`), not in a tracked `.env`.
+
+## How it works
+
+The root [`.npmrc`](.npmrc) sets `node-options=--require=env-preload`,
+so pnpm exports `NODE_OPTIONS=--require=...` for every node process it spawns from a
+script. The preload ([`env-preload/preload-env.cjs`](env-preload/preload-env.cjs)) loads
+`~/.jitsu/.env.local`, then walks up from `process.cwd()` to find `pnpm-workspace.yaml`
+and load the repo-root `.env.local`. (Why a preload instead of `--env-file-if-exists`:
+Node disallows `--env-file*` in `NODE_OPTIONS` for security; `--require` is allowed.)
+
+## Adding to the shared layer
+
+```bash
+mkdir -p ~/.jitsu && chmod 700 ~/.jitsu
+touch ~/.jitsu/.env.local && chmod 600 ~/.jitsu/.env.local
+echo 'STRIPE_KEY=sk_live_xxx' >> ~/.jitsu/.env.local
+```
+
+# Testing
+
+`pnpm test` runs every package's tests. Most are plain vitest/jest suites; the console
+has a two-project setup worth knowing about.
+
+## Console tests (`webapps/console`)
+
+Two vitest projects, split by what they need:
+
+- **unit** (`__tests__/unit/`) — pure tests, no external dependencies. Instant, run anywhere.
+- **integration** (`__tests__/integration/`) — service tests against **real Postgres and
+  ClickHouse** started via testcontainers (Docker required), with MSW intercepting all
+  outbound HTTP. No `vi.mock` anywhere: SQL runs against real databases, access checks and
+  audit logging hit the same database the service writes to.
+
+```bash
+cd webapps/console
+pnpm test                          # both projects (starts containers)
+pnpm exec vitest run --project unit           # pure tests only, no Docker
+pnpm exec vitest run __tests__/integration/sync-service.test.ts   # one file
+```
+
+How the harness works (`__tests__/integration/support/`): a global setup boots one
+Postgres (`postgres:18-alpine`, matching prod) and one ClickHouse
+(`clickhouse/clickhouse-server:25.4-alpine`) container per run and pushes the prisma
+schema into a sealed template database. Each test file runs in its own process (vitest
+forks + isolate) and clones the template into a private database (~150ms), so files are
+fully isolated and can run in parallel. Baseline env is set before the test file's imports,
+which is what binds the `db.prisma()` / `pgPool` / `clickhouse` singletons to the per-file
+databases. Every outbound HTTP request must have an MSW handler (`server.use(...)`) or the
+test fails loudly; requests to the ClickHouse container pass through.
+
+### Container reuse (optional, local only)
+
+A cold run pays for container boot + `prisma db push` (~10–30s depending on the machine,
+more if images need pulling). To keep the containers running between runs:
+
+```bash
+CONSOLE_TEST_CONTAINERS_REUSE=1 pnpm test
+```
+
+Subsequent runs connect in about a second. The template database is keyed by a hash of
+`schema.prisma`, so schema changes rebuild it automatically, and leftover per-file
+databases from previous runs are swept at startup. **Trade-off: the two containers keep
+running until you remove them** (`docker ps` → `docker rm -f <id>`). Don't set this in CI.
+
+Notes:
+
+- `vitest --watch` is supported for the unit project; for integration prefer `vitest run`
+  (re-runs re-clone databases in new forks, containers stay up for the session).
+- Per-test env overrides use `vi.stubEnv` (auto-restored). Baseline env lives in
+  `__tests__/integration/support/setup.ts`.
+- `__tests__/integration/support/harness.ts` exposes `deps()` (the real singletons) and
+  `seedWorkspace()`; other fixtures are plain `prisma.create` / `clickhouse.insert` calls
+  inline in the tests.
+
+# Development Workflow
+
+## Development Branch
+
+The default development branch is `newjitsu`.
+
+## Common Principles
+
+**Branch naming:** Use a type prefix — `feat/`, `fix/`, `chore/`. Example: `feat/workspace-oidc`.
+
+**Merging policy:** When working on a feature branch, never merge the default branch into
+it — always rebase your branch onto the latest default branch. When merging a PR into the
+default branch, either "Create a merge commit" (the default) or "Rebase and merge" is fine.
+Squash merge stays off; if you want to squash overly granular commits, do it locally before
+opening the PR.
+
+**Commit style:** [Conventional commits](https://www.conventionalcommits.org/) —
+`type(scope): description`. Common types: `fix`, `feat`, `chore`, `refactor`, `ci`.
+Examples: `fix(rotor): enable DNS caching for undici pools`,
+`feat(console): add workspace OIDC configuration`.
+
+## PRs vs Direct Commits
+
+Trivial changes, bug fixes, and config updates go directly to `newjitsu`. Larger or
+riskier changes use pull requests. The engineer decides based on complexity and risk.
+
+## CI Checks
+
+[lint.yml](.github/workflows/lint.yml) runs on every push and PR:
+
+- Prettier format check, TypeScript typecheck, ESLint
+- Jest unit tests
+- Playwright E2E tests (frontend changes only)
+- Go integration tests against real cloud warehouses (AWS S3, BigQuery, Redshift, Snowflake)
+
+## AI Review
+
+[ai-review.yml](.github/workflows/ai-review.yml) runs on every PR and on direct pushes
+to `newjitsu`. It uses OpenAI Codex to check for bugs, security issues, and correctness
+problems — style nitpicks are skipped. For PRs it posts a review via a GitHub App. For
+direct commits it posts a commit comment.
+
+## Release
+
+There are two independent release pipelines with separate versioning.
+
+**Services & CLI tools** — Docker images for backend services (console, rotor,
+functions-server, bulker, ingest, and others) and NPM packages (`jitsu-cli`,
+`@jitsu/functions-lib`). Managed by
+[services.yaml](.github/workflows/services.yaml).
+Base version in [.services.version.json](.services.version.json).
+
+**Client libraries** — NPM packages `@jitsu/js`, `@jitsu/jitsu-react`,
+`@jitsu/protocols`. Managed by
+[client-libraries.yaml](.github/workflows/client-libraries.yaml).
+Base version in [.jsclient.version.json](.jsclient.version.json).
+
+Each pipeline publishes to three channels determined by the branch:
+
+| Pipeline         | `newjitsu`              | `stable-services`  | `stable-jsclient`  | Any other branch                          |
+|------------------|-------------------------|--------------------|--------------------|-------------------------------------------|
+| Services & CLI   | beta — `2.14.1-beta.N`  | stable — `2.14.1`  | —                  | canary — `2.14.1-canary.20260416.abc1234` |
+| Client libraries | beta — `1.11.0-beta.N`  | —                  | stable — `1.11.0`  | canary — `1.11.0-canary.20260416.abc1234` |
+
+- **Stable** — `X.Y.Z`
+- **Beta** — `X.Y.Z-beta.N`, where `N` is auto-incremented based on existing git tags
+- **Canary** — `X.Y.Z-canary.YYYYMMDD.shortsha` — no git tag or GitHub release created
+- The base version `X.Y` is defined in `.services.version.json` or `.jsclient.version.json`;
+  `Z` is the patch number, incremented per release
+
+Builds are **not** produced on every merge. A push to `newjitsu` publishes only when a
+version file (`.services.version.json` or `.jsclient.version.json`) is bumped in that
+push: [lint.yml](.github/workflows/lint.yml) waits for tests to pass, then dispatches
+[publish.yml](.github/workflows/publish.yml), which builds the affected stack(s) — stable
+if the matching version file changed, otherwise beta. Commits that don't bump a version
+file publish nothing; trigger off-cycle canary/beta builds with a manual `publish.yml`
+dispatch. On a successful beta or stable release, a GitHub release is created and the infra
+repo is notified via webhook to update deployment configs.

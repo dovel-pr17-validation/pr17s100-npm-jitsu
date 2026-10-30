@@ -1,0 +1,316 @@
+import { signFunctionsRequest } from "juava/src/functions-auth";
+import type { PrismaClient } from "@prisma/client";
+import type { NextApiRequest } from "next";
+import { getErrorMessage, randomId, requireDefined, rpc } from "juava";
+import { SessionUser } from "../schema";
+import { verifyAccessWithRole } from "../api";
+import { ApiError } from "../shared/errors";
+import { getConfigObjectType, parseObject } from "../schema/config-objects";
+import { containsMaskedSecrets, unmaskSecretsFromOriginal } from "../schema/secrets";
+import { httpAgent, httpsAgent } from "./http-agent";
+import { getServerEnv } from "./serverEnv";
+import { getServerLog } from "./log";
+import { assertCustomDomainsAllowed } from "./plan-gate";
+import { createWarehouseReader } from "@jitsu/warehouse-query";
+import { warehouseErrorMessage } from "./warehouse-errors";
+
+const log = getServerLog("debug-service");
+
+export interface DebugServiceDeps {
+  prisma: PrismaClient;
+  createWarehouseReader?: typeof createWarehouseReader;
+}
+
+// Class priority order: premium > dedicated > free (same as function/run.ts).
+const classPriority = ["premium", "dedicated", "free"];
+
+export type FunctionRunResult = {
+  error?: { name: string; message: string; stack?: string; retryPolicy?: any };
+  dropped?: boolean;
+  result?: any;
+  store: Record<string, any>;
+  logs: any[];
+  meta?: any;
+  backend?: string;
+};
+
+const runtimeNotReady = (what: string): FunctionRunResult => ({
+  error: {
+    name: "FunctionRuntimeNotReady",
+    message: `${what} for this workspace is being initialized. Please try again in a few minutes. If this message persists, please contact support.`,
+  },
+  store: {},
+  logs: [],
+});
+
+/**
+ * Test/debug operations extracted from `config/[type]/test.ts` (bulker credential test),
+ * `function/run.ts`, and `profile-builder/run.ts` so the MCP server shares one implementation
+ * of secret unmasking, input filtering, and functions-server dispatch. When `code` isn't
+ * supplied, the run methods load the stored draft/code of the referenced function so an agent
+ * can exercise what's deployed without round-tripping the source.
+ */
+export class DebugService {
+  private readonly prisma: PrismaClient;
+  private readonly createWarehouseReader: typeof createWarehouseReader;
+
+  constructor(deps: DebugServiceDeps) {
+    this.prisma = deps.prisma;
+    this.createWarehouseReader = deps.createWarehouseReader ?? createWarehouseReader;
+  }
+
+  /**
+   * Credential test via Bulker, or the read-only reader for source-only Redshift. Either
+   * pass a full `config` (masked secrets are unmasked from the stored object referenced by
+   * `config.id`/`config.cloneId`) or just `id` to test an existing object as stored.
+   */
+  async testConnection(
+    user: SessionUser,
+    workspaceId: string,
+    type: string,
+    opts: { config?: any; id?: string; req?: NextApiRequest }
+  ): Promise<any> {
+    // Testing an arbitrary configuration can run mutating input filters (stream
+    // domain provisioning is one), so it requires the same permission as a
+    // configuration write.
+    await verifyAccessWithRole(user, workspaceId, "editEntities");
+    const workspace = requireDefined(
+      await this.prisma.workspace.findFirst({ where: { id: workspaceId } }),
+      `Workspace ${workspaceId} not found`
+    );
+    let body = opts.config;
+    let testedExisting: { config: any } | null = null;
+    if (!body) {
+      const id = requireDefined(opts.id, "either `config` or `id` must be provided");
+      const existing = await this.prisma.configurationObject.findFirst({
+        where: { id, workspaceId, type, deleted: false },
+      });
+      if (!existing) {
+        throw new ApiError(`${type} with id ${id} does not exist`, { status: 404 });
+      }
+      testedExisting = existing;
+      body = { ...(existing.config as any), id };
+    } else if (body.id) {
+      testedExisting = await this.prisma.configurationObject.findFirst({
+        where: { id: body.id, workspaceId, type, deleted: false },
+        select: { config: true },
+      });
+    }
+    body = { ...body, workspaceId, type, id: body.id ?? randomId() };
+    const configObjectType = getConfigObjectType(type);
+    let object = parseObject(type, body);
+    if (containsMaskedSecrets(object)) {
+      const existingEntity = body.cloneId
+        ? await this.prisma.configurationObject.findFirst({ where: { id: body.cloneId, workspaceId } })
+        : testedExisting;
+      if (existingEntity?.config) {
+        log.atInfo().log(`Unmasking secrets for ${type} test: ${body.id}`);
+        object = unmaskSecretsFromOriginal(object, existingEntity.config as any);
+      }
+    }
+    // Must run before inputFilter: a stream filter provisions submitted
+    // domains in ingress. Treat domains already stored on the tested object as
+    // grandfathered, matching update and domain-check behavior.
+    await assertCustomDomainsAllowed(user, workspace, type, object, testedExisting?.config, opts.req);
+    object = await configObjectType.inputFilter(object, "create", workspace);
+
+    if (type === "destination" && object.destinationType === "redshift" && !object.bucket?.trim()) {
+      // No ingestion/S3 staging is involved. Test the same TLS/password path the
+      // runner uses, after authorization, parsing and stored-secret unmasking.
+      try {
+        const reader = this.createWarehouseReader(object);
+        try {
+          await reader.preview("SELECT 1 AS jitsu_connection_test", AbortSignal.timeout(30_000));
+          return { ok: true };
+        } finally {
+          await reader.close();
+        }
+      } catch (error) {
+        return { ok: false, error: warehouseErrorMessage(error, object, "Warehouse connection test failed.") };
+      }
+    }
+
+    const serverEnv = getServerEnv();
+    const bulkerURLEnv = requireDefined(serverEnv.BULKER_URL, "env BULKER_URL is not defined");
+    const bulkerAuthKey = serverEnv.BULKER_AUTH_KEY ?? "";
+    const isHttps = bulkerURLEnv.startsWith("https://");
+    const options: any = {
+      method: "POST",
+      agent: (isHttps ? httpsAgent : httpAgent)(),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(object),
+    };
+    if (bulkerAuthKey) {
+      options.headers["Authorization"] = `Bearer ${bulkerAuthKey}`;
+    }
+    try {
+      const response = await fetch(bulkerURLEnv + "/test", options);
+      return await response.json();
+    } catch (e) {
+      throw new ApiError(`failed to fetch bulker API: ${getErrorMessage(e)}`, { status: 500 });
+    }
+  }
+
+  /** Backs `function/run.ts`. `code` omitted → the stored function's draft (falls back to code). */
+  async runFunction(
+    user: SessionUser,
+    workspaceId: string,
+    opts: {
+      functionId: string;
+      functionName?: string;
+      code?: string;
+      event: any;
+      variables?: any;
+      store?: any;
+      userAgent?: string;
+    }
+  ): Promise<FunctionRunResult> {
+    await verifyAccessWithRole(user, workspaceId, "editEntities");
+    let code = opts.code;
+    let functionName = opts.functionName;
+    if (code === undefined) {
+      const func = await this.prisma.configurationObject.findFirst({
+        where: { id: opts.functionId, workspaceId, type: "function", deleted: false },
+      });
+      if (!func) {
+        throw new ApiError(`function with id ${opts.functionId} does not exist`, { status: 404 });
+      }
+      const cfg = func.config as any;
+      code = requireDefined(cfg.draft ?? cfg.code, `function ${opts.functionId} has no code`);
+      functionName = cfg.name;
+    }
+    const deploymentId = await this.getDeploymentId(workspaceId);
+    if (!deploymentId) {
+      return runtimeNotReady("Function runtime");
+    }
+    const url = this.functionsServerUrl(deploymentId, "/udfrun");
+    log.atInfo().log(`Running function ${opts.functionId} for workspace ${workspaceId} via ${url}`);
+    const body = {
+      functionId: opts.functionId,
+      functionName,
+      code,
+      event: opts.event,
+      variables: opts.variables ?? {},
+      store: opts.store ?? {},
+      userAgent: opts.userAgent,
+      workspaceId,
+    };
+    return await rpc(url, {
+      method: "POST",
+      body,
+      headers: this.functionsAuthHeaders(deploymentId, url, body),
+    });
+  }
+
+  /**
+   * Backs `profile-builder/run.ts`. `code`/`settings`/`version` omitted → loaded from the
+   * stored profile builder (its function's draft/code and `connectionOptions`).
+   */
+  async runProfileBuilder(
+    user: SessionUser,
+    workspaceId: string,
+    opts: {
+      profileBuilderId: string;
+      events: any[];
+      code?: string;
+      settings?: any;
+      version?: number;
+      store?: any;
+      userAgent?: string;
+    }
+  ): Promise<FunctionRunResult> {
+    await verifyAccessWithRole(user, workspaceId, "editEntities");
+    const pb = await this.prisma.profileBuilder.findFirst({
+      where: { id: opts.profileBuilderId, workspaceId, deleted: false },
+      include: { functions: { include: { function: true } } },
+    });
+    if (!pb) {
+      throw new ApiError(`profile builder with id ${opts.profileBuilderId} does not exist`, { status: 404 });
+    }
+    let code = opts.code;
+    if (code === undefined) {
+      const funcConfig = pb.functions[0]?.function?.config as any;
+      code = requireDefined(
+        funcConfig?.draft ?? funcConfig?.code,
+        `profile builder ${opts.profileBuilderId} has no function code — pass \`code\` explicitly`
+      );
+    }
+    const deploymentId = await this.getDeploymentId(workspaceId);
+    if (!deploymentId) {
+      return runtimeNotReady("Profile builder runtime");
+    }
+    const url = this.profileBuilderRunUrl(deploymentId);
+    log.atInfo().log(`Running profile builder ${opts.profileBuilderId} for workspace ${workspaceId} via ${url}`);
+    const body = {
+      id: pb.id,
+      name: pb.name,
+      version: opts.version ?? pb.version,
+      code,
+      events: opts.events,
+      settings: opts.settings ?? pb.connectionOptions ?? {},
+      store: opts.store ?? {},
+      userAgent: opts.userAgent,
+      workspaceId,
+    };
+    return await rpc(url, {
+      method: "POST",
+      body,
+      headers: getServerEnv().FUNCTIONS_SERVER_URL_TEMPLATE
+        ? this.functionsAuthHeaders(deploymentId, url, body)
+        : this.rotorAuthHeaders(),
+    });
+  }
+
+  /** Highest-priority functions-server deployment for the workspace (premium > dedicated > free). */
+  private async getDeploymentId(workspaceId: string): Promise<string | undefined> {
+    const records = await this.prisma.functionsServer.findMany({
+      where: { workspaceId },
+      select: { class: true, deploymentId: true },
+    });
+    for (const cls of classPriority) {
+      const record = records.find(r => r.class === cls);
+      if (record?.deploymentId) {
+        return record.deploymentId;
+      }
+    }
+    return undefined;
+  }
+
+  private functionsServerUrl(deploymentId: string, path: string): string {
+    const template = requireDefined(
+      getServerEnv().FUNCTIONS_SERVER_URL_TEMPLATE,
+      "env FUNCTIONS_SERVER_URL_TEMPLATE is not set. Functions server is required to run functions"
+    );
+    return template.replace("${workspaceId}", deploymentId) + path;
+  }
+
+  // profile-builder/run.ts keeps a ROTOR_URL fallback for installations without
+  // per-workspace functions servers — preserve it.
+  private profileBuilderRunUrl(deploymentId: string): string {
+    const serverEnv = getServerEnv();
+    if (!serverEnv.FUNCTIONS_SERVER_URL_TEMPLATE) {
+      const rotorURL = requireDefined(
+        serverEnv.ROTOR_URL,
+        `env ROTOR_URL is not set. Rotor is required to run functions`
+      );
+      return rotorURL + "/profileudfrun";
+    }
+    return this.functionsServerUrl(deploymentId, "/profileudfrun");
+  }
+
+  private functionsAuthHeaders(deploymentId: string, url: string, body: unknown): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      ...signFunctionsRequest(getServerEnv().FUNCTIONS_SERVER_PRIVATE_KEY, deploymentId, url, JSON.stringify(body)),
+    };
+  }
+
+  private rotorAuthHeaders(): Record<string, string> {
+    const rotorAuthKey = getServerEnv().ROTOR_AUTH_KEY;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (rotorAuthKey) {
+      headers["Authorization"] = `Bearer ${rotorAuthKey}`;
+    }
+    return headers;
+  }
+}

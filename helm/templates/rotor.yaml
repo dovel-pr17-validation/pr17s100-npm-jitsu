@@ -1,0 +1,85 @@
+{{- if gt (int .Values.scaling.rotor.replicas) 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rotor
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: rotor
+spec:
+  replicas: {{ .Values.scaling.rotor.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rotor
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rotor
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: rotor
+          image: node:24-bookworm
+          workingDir: /cache/workspace/services/rotor
+          command: ["npx", "tsx", "--no-node-snapshot", "--max-old-space-size=2048", "src/index.ts"]
+          ports:
+            - name: http
+              containerPort: 3401
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: jitsu-secrets
+            # Connection URLs of the in-cluster dependencies (helm-deps chart).
+            # Listed after jitsu-secrets so its keys win over any legacy URL
+            # keys there; explicit env entries below still take precedence.
+            - secretRef:
+                name: jitsu-deps-urls
+                optional: true
+          env:
+            {{- include "jitsu-dev.env" (dict "ctx" . "service" "rotor") | nindent 12 }}
+          volumeMounts:
+            - name: node-cache
+              mountPath: /cache
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: node-cache
+          persistentVolumeClaim:
+            claimName: node-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rotor
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: rotor
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 3401
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: rotor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

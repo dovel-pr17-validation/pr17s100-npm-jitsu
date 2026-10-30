@@ -1,0 +1,1319 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	bulker "github.com/jitsucom/bulker/bulkerlib"
+	"github.com/jitsucom/bulker/bulkerlib/implementations/sql"
+	"github.com/jitsucom/bulker/eventslog"
+	"github.com/jitsucom/bulker/jitsubase/jsonorder"
+	"github.com/jitsucom/bulker/jitsubase/pg"
+	"github.com/jitsucom/bulker/jitsubase/timestamp"
+	types2 "github.com/jitsucom/bulker/jitsubase/types"
+	"github.com/jitsucom/bulker/jitsubase/utils"
+	"github.com/jitsucom/bulker/sync-sidecar/db"
+)
+
+const interruptError = "Stream was interrupted. Check logs for errors."
+const somethingWentWrongError = "Something went wrong in the connector. See the logs for more details."
+const cancelledError = "Sync job was cancelled"
+
+var forceTemporaryBatchesDestinations = map[string]int{
+	"webhook": 100,
+	"duckdb":  10000,
+}
+
+type ReadSideCar struct {
+	*AbstractSideCar
+	namespace       string
+	functionsEnv    string
+	tableNamePrefix string
+	toSameCase      bool
+	addMeta         bool
+	deduplicate     bool
+
+	lastMessageTime atomic.Int64
+	bulkerStartTime atomic.Int64
+	// downstreamBusy counts in-flight non-commit downstream calls (bulker
+	// Consume per record and state DB writes). The watchdog ORs this with
+	// bulkerStartTime: while either is non-zero, the sidecar is actively
+	// pushing data and the source has likely gone silent because its FIFO
+	// write is blocked — not because it's dead. Without this gate a slow
+	// destination during Consume, or a slow Postgres during state save,
+	// can starve lastMessageTime and trip the 2h watchdog falsely.
+	downstreamBusy atomic.Int64
+	// processRecordStart records the unix-time when the stdout reader
+	// entered bulker Consume (0 when not in one). The watchdog uses it to
+	// catch a wedged Consume against a slow destination — a hazard that
+	// would otherwise hide behind the downstreamBusy gate. State DB writes
+	// don't need an equivalent: the dbpool is configured with a 2-minute
+	// statement_timeout, so a stuck UpsertState fails fast with an error.
+	processRecordStart atomic.Int64
+	lastStateMessage   string
+	blk                bulker.Bulker
+	lastStream         *ActiveStream
+	processedStreams   map[string]*ActiveStream
+	catalog            *jsonorder.OrderedMap[string, *Stream]
+	destinationConfig  map[string]any
+	initialState       string
+	fullSync           bool
+	eventsCounter      int
+	bytesCounter       int
+}
+
+func (s *ReadSideCar) Run() {
+	var err error
+
+	// Bound every query at 2 minutes — the sidecar only does small metadata
+	// writes (task_log, source_task, source_state). Any stuck Postgres call
+	// fails fast with a cancellation error instead of blocking the stdout
+	// reader indefinitely on a wedged connection.
+	// Same failover window as the writes below: a sidecar that starts while the
+	// primary is being promoted cannot reach it, and panicking here kills the
+	// sync before it has done anything. Retried on the same budget.
+	//
+	// Building the pool is not enough to know that. pgxpool.NewWithConfig is
+	// lazy — pool_min_conns defaults to zero, so it returns a pool without
+	// dialling anything, and an unreachable primary surfaces at the first
+	// write rather than here. The connection has to be proven with a Ping, or
+	// this loop only ever retries malformed DSNs, which retrying cannot fix.
+	for i := 1; ; i++ {
+		s.dbpool, err = pg.NewPGPool(s.databaseURL, pg.WithStatementTimeout(2*time.Minute))
+		if err != nil {
+			// Parse/config failure, not a reachability one: permanent.
+			s.panic("Unable to create postgres connection pool: %v", err)
+		}
+		// Derived from the shutdown context, not Background: a SIGTERM during
+		// this ping abandons it instead of running out the full timeout.
+		ctx, cancel := context.WithTimeout(s.shutdownCtx(), poolPingTimeout)
+		err = s.dbpool.Ping(ctx)
+		cancel()
+		if err == nil {
+			if i > 1 {
+				s.log("postgres connection pool created after %d attempts", i)
+			}
+			break
+		}
+		// Don't leak the pool we are about to replace.
+		s.dbpool.Close()
+		s.dbpool = nil
+		if isPermanentPgError(err) {
+			s.panic("Unable to reach postgres: %v", err)
+		}
+		// Nothing has installed the deferred status writer yet — that happens
+		// below, once the pool exists — so a sidecar killed in here records
+		// nothing at all. Stop on the first opportunity rather than spending
+		// another ping and sleep against a grace period that is already
+		// running.
+		if s.cancelled.Load() {
+			s.panic("Unable to reach postgres; giving up, the sidecar is shutting down: %v", err)
+		}
+		if i >= 10 {
+			s.panic("Unable to reach postgres after %d attempts: %v", i, err)
+		}
+		delay := utils.Ternary(time.Duration(i)*time.Second > 30*time.Second, 30*time.Second, time.Duration(i)*time.Second)
+		// stdout only: s.dbpool is what we are failing to build, so any logging
+		// primitive that writes to it would nil-panic here.
+		fmt.Printf("WARN : Unable to reach postgres (attempt %d/10), retrying in %s: %v\n", i, delay, err)
+		s.sleepCancellable(delay)
+	}
+	defer s.dbpool.Close()
+
+	s.log("Sidecar. command: read. syncId: %s, taskId: %s, package: %s:%s startedAt: %s", s.syncId, s.taskId, s.packageName, s.packageVersion, s.startedAt.Format(time.RFC3339))
+
+	s.relayInitContainerLogs()
+	s.fullSync = os.Getenv("FULL_SYNC") == "true"
+	if s.fullSync {
+		s.log("Running in Full Sync mode")
+	}
+
+	s.lastMessageTime.Store(time.Now().Unix())
+
+	defer func() {
+		cancelled := s.cancelled.Load()
+		timeExceeded := cancelled && time.Now().Sub(s.startedAt) > time.Hour*time.Duration(s.taskTimeoutHours)
+		if r := recover(); r != nil {
+			s.registerErr(fmt.Errorf("%v", r))
+			s.closeActiveStreams(false)
+		} else {
+			s.closeActiveStreams(!cancelled && !s.isCriticalError())
+		}
+		if len(s.processedStreams) > 0 {
+			statusMap := jsonorder.NewOrderedMap[string, any](0)
+			s.catalog.ForEach(func(streamName string, _ *Stream) {
+				if stream, ok := s.processedStreams[streamName]; ok {
+					statusMap.Set(streamName, stream.StreamStat)
+				} else {
+					if timeExceeded {
+						statusMap.Set(streamName, &StreamStat{Status: "TIME_EXCEEDED"})
+					} else if cancelled {
+						statusMap.Set(streamName, &StreamStat{Status: "CANCELLED"})
+					} else {
+						statusMap.Set(streamName, &StreamStat{Status: "FAILED", Error: "Stream was not processed. Check logs for errors."})
+					}
+				}
+			})
+			allSuccess := true
+			allFailed := true
+			statusMap.ForEach(func(_ string, streamStat any) {
+				st := streamStat.(*StreamStat)
+				if st.Status != "SUCCESS" {
+					allSuccess = false
+				}
+				if st.Status != "FAILED" {
+					allFailed = false
+				}
+			})
+			status := "PARTIAL"
+			errorText := ""
+			if allSuccess {
+				status = "SUCCESS"
+			} else if allFailed {
+				status = "FAILED"
+			} else if timeExceeded {
+				status = "TIME_EXCEEDED"
+				errorText = fmt.Sprintf("Task timeout: The task has been running for more than %d hours. Consider splitting the selected streams into multiple Sync entities.", s.taskTimeoutHours)
+			} else if cancelled {
+				status = "CANCELLED"
+				errorText = "The task was cancelled"
+			} else if s.firstErr != nil {
+				errorText = "ERROR: " + s.firstErr.Error()
+			}
+
+			if allFailed && s.firstErr != nil {
+				s.sendBadStatus("FAILED", "ERROR: "+s.firstErr.Error())
+			} else {
+				processedStreamsJson, _ := jsonorder.Marshal(statusMap)
+				s.sendGoodStatus(status, string(processedStreamsJson), errorText, true)
+			}
+		} else if s.isErr() {
+			s.sendBadStatus("FAILED", "ERROR: "+s.firstErr.Error())
+			os.Exit(1)
+		} else if timeExceeded {
+			s.sendBadStatus("TIME_EXCEEDED", fmt.Sprintf("Task timeout: task is running for more than %d hours.", s.taskTimeoutHours))
+		} else if cancelled {
+			s.sendBadStatus("CANCELLED", "The task was cancelled")
+		} else {
+			s.sendGoodStatus("SUCCESS", "", "", true)
+		}
+	}()
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	go func() {
+		for range ticker.C {
+			now := time.Now().Unix()
+			// Specific stuck-call checks first so the panic message points
+			// at the actual blocked syscall (vs. a generic "no messages").
+			if start := s.processRecordStart.Load(); start != 0 && now-start > 8000 {
+				s.panic("processRecord (bulker Consume) stuck for more than 2 hours. Exiting")
+			}
+			// Gate the source-silence panic on three signals: no commit in
+			// flight (bulkerStartTime), no per-record/state downstream work
+			// in flight (downstreamBusy), and >2h since the last sign of life
+			// (lastMessageTime — stdout, stderr, or commit completion). If
+			// any downstream path is active the source is likely blocked
+			// writing into a full FIFO, not stuck — don't kill the pod.
+			if s.bulkerStartTime.Load() == 0 && s.downstreamBusy.Load() == 0 && now-s.lastMessageTime.Load() > 8000 {
+				s.panic("No messages from %s for 2 hours. Exiting", s.packageName)
+			}
+		}
+	}()
+
+	err = s.loadDestinationConfig()
+	if err != nil {
+		s.panic("Error loading destination config: %v", err)
+	}
+	blk, err := bulker.CreateBulker(bulker.Config{
+		Id:                fmt.Sprintf("%s_%s", s.syncId, s.taskId),
+		BulkerType:        s.destinationConfig["destinationType"].(string),
+		DestinationConfig: s.destinationConfig,
+	})
+	if err != nil {
+		s.panic("Error creating bulker: %v", err)
+	}
+	s.blk = blk
+	err = s.loadCatalog()
+	if err != nil {
+		s.panic("Error loading catalog: %v", err)
+	}
+	s.log("Catalog loaded. %d streams selected", s.catalog.Len())
+	state, ok := s.loadState()
+	if ok {
+		s.log("State loaded: %s", state)
+	}
+	// Materialize the source_task row up front so the UI sees the run as
+	// soon as the sidecar boots. Without this the row only appears when
+	// the source connector emits its first STREAM_STATUS=STARTED trace or
+	// hits a commit (updateRunningStatus), which for slow-starting sources
+	// (heavy discovery, large initial API calls) can be 10+ minutes after
+	// the pod started — and syncctl's RUNNING heartbeats are UPDATE-only,
+	// so they silently no-op until something INSERTs.
+	s.updateRunningStatus()
+	var stdOutErrWaitGroup sync.WaitGroup
+
+	s.errPipe, _ = os.Open(s.stdErrPipeFile)
+	defer s.errPipe.Close()
+	stdOutErrWaitGroup.Add(1)
+	// read from stderr
+	go func() {
+		defer stdOutErrWaitGroup.Done()
+		scanner := bufio.NewScanner(s.errPipe)
+		scanner.Buffer(make([]byte, 1024*10), 1024*1024*10)
+		for scanner.Scan() {
+			// Source stderr counts as liveness: Python/Java connectors emit
+			// their normal logging (progress, rate-limit waits, retries) on
+			// stderr while RECORD/STATE/TRACE go to stdout. Without this the
+			// watchdog could falsely trip when the sidecar's stdout reader
+			// is busy (Consume/state save) and the source is fully chatty
+			// on stderr.
+			s.lastMessageTime.Store(time.Now().Unix())
+			line := scanner.Text()
+			s.sourceLog("ERRSTD", line)
+		}
+		if err := scanner.Err(); err != nil && !s.cancelled.Load() {
+			s.panic("error reading from err pipe: %v", err)
+		}
+	}()
+
+	s.processedStreams = map[string]*ActiveStream{}
+	s.outPipe, _ = os.Open(s.stdOutPipeFile)
+	defer s.outPipe.Close()
+	if s.cancelled.Load() {
+		return
+	}
+	stdOutErrWaitGroup.Add(1)
+	// read from stdout
+	go func() {
+		defer stdOutErrWaitGroup.Done()
+
+		scanner := bufio.NewScanner(s.outPipe)
+		scanner.Buffer(make([]byte, 1024*10), 1024*1024*100)
+		for scanner.Scan() {
+			s.lastMessageTime.Store(time.Now().Unix())
+			line := scanner.Bytes()
+			lineStr := string(line)
+			ok = s.checkJsonRow(lineStr)
+			if !ok {
+				continue
+			}
+			row := &Row{}
+			err := jsonorder.Unmarshal(line, row)
+			if err != nil {
+				s._log("jitsu", "ERROR", fmt.Sprintf("error parsing airbyte line %s: %v", string(line), err))
+				s.sourceLog("INFO", lineStr)
+				continue
+			}
+			switch row.Type {
+			case LogType:
+				if row.Log.Level == "ERROR" || row.Log.Level == "FATAL" {
+					stream, ok := s.getSolelyRunningStream()
+					if ok && stream != nil {
+						stream.errorFromLogs = row.Log.Message
+					}
+				}
+				level := strings.ToUpper(row.Log.Level)
+				if shouldLog(level, s.logLevel) || shouldLog(level, s.dbLogLevel) {
+					s.sourceLog(row.Log.Level, row.Log.Message)
+				}
+			case DebugType:
+				message := row.Message
+				if row.Data != nil {
+					jsonData, _ := jsonorder.Marshal(row.Data)
+					sData := string(jsonData)
+					if sData != "" && sData != "{}" {
+						message = fmt.Sprintf("%s: %s", message, sData)
+					}
+				}
+				if shouldLog("DEBUG", s.logLevel) || shouldLog("DEBUG", s.dbLogLevel) {
+					s.sourceLog("DEBUG", message)
+				}
+			case StateType:
+				if s.lastStateMessage != lineStr {
+					s.processState(row.State)
+					s.lastStateMessage = lineStr
+				}
+			case RecordType:
+				s.processRecord(row.Record, len(line))
+			case TraceType:
+				s.processTrace(row.Trace, lineStr)
+			case ControlType:
+				s.sourceLog("WARN", "Control messages are not supported and ignored: %s", lineStr)
+			default:
+				s.panic("not supported Airbyte message type: %s: %s", row.Type, lineStr)
+			}
+		}
+		if err := scanner.Err(); err != nil && !s.cancelled.Load() {
+			s.panic("error reading from pipe: %v", err)
+		}
+	}()
+	stdOutErrWaitGroup.Wait()
+}
+
+func (s *ReadSideCar) getSolelyRunningStream() (*ActiveStream, bool) {
+	var first *ActiveStream
+	for _, stream := range s.processedStreams {
+		if stream.Status == "RUNNING" {
+			if first == nil {
+				first = stream
+			} else {
+				return nil, false
+			}
+		}
+	}
+	return first, first != nil
+}
+
+func (s *ReadSideCar) processState(state *StateRow) {
+	//checkpointing. commit to bulker all processed events on saving state
+	switch state.Type {
+	case "GLOBAL":
+		s.checkpointIfNecessary(s.lastStream)
+		s.saveState("_GLOBAL_STATE", state.GlobalState)
+	case "STREAM":
+		streamName := joinStrings(state.StreamState.StreamDescriptor.Namespace, state.StreamState.StreamDescriptor.Name, ".")
+		var ok bool
+		stream, ok := s.processedStreams[streamName]
+		if ok && stream != nil {
+			stream.unsavedState = state.StreamState.StreamState
+			s.checkpointIfNecessary(stream)
+		}
+	case "LEGACY", "":
+		s.checkpointIfNecessary(s.lastStream)
+		s.saveState("_LEGACY_STATE", state.Data)
+	}
+}
+
+func (s *ReadSideCar) saveState(stream string, data any) {
+	if data == nil {
+		return
+	}
+	if stream != "_LEGACY_STATE" && stream != "_GLOBAL_STATE" {
+		processed, ok := s.processedStreams[stream]
+		if !ok {
+			s.errprint("STATE: cannot save state for stream '%s' because it was not processed", stream)
+			return
+		}
+		if processed.Error != "" {
+			s.errprint("STATE: not saving state for stream '%s' because of previous errors", stream)
+			return
+		}
+	} else {
+		if s.isCriticalError() {
+			s.errprint("STATE: not saving '%s' state because of previous errors", stream)
+			return
+		}
+	}
+	stateJson, err := jsonorder.Marshal(data)
+	if err != nil {
+		s.panic("error marshalling state %+v: %v", data, err)
+	}
+	s.log("SAVING STATE for '%s': %s", stream, utils.ShortenStringWithEllipsisMiddle(string(stateJson), 255, "\n...\n"))
+	s.storeState(stream, string(stateJson))
+}
+
+func (s *ReadSideCar) closeStream(streamName string, complete bool) {
+	stream, ok := s.processedStreams[streamName]
+	if !ok || stream == nil {
+		s.errprint("Stream '%s' is not in processed streams", streamName)
+		return
+	}
+	s._closeStream(stream, complete, false)
+}
+
+func (s *ReadSideCar) manageBulkerTimeout(eventsCount int) func() {
+	s.bulkerStartTime.Store(time.Now().Unix())
+	period := time.Duration(max(eventsCount/185, 3600)) * time.Second
+	timer := time.NewTimer(period)
+	go func() {
+		t := <-timer.C
+		if !t.IsZero() {
+			s.panic("Bulker is running for more than %s. Exiting", period)
+		}
+	}()
+	return func() {
+		timer.Stop()
+		s.lastMessageTime.Store(time.Now().Unix())
+		s.bulkerStartTime.Store(0)
+	}
+}
+
+func (s *ReadSideCar) checkpointIfNecessary(stream *ActiveStream) {
+	if stream == nil {
+		return
+	}
+	// for successfully closed stream it is safe to save state
+	// otherwise we save state only after commit to warehouse
+	if stream.Status == "SUCCESS" {
+		s.saveState(stream.name, stream.unsavedState)
+		stream.unsavedState = nil
+		return
+	}
+	if !stream.IsActive() {
+		return
+	}
+	if stream.bufferedEventsCount >= 500000 || (stream.mode == "incremental" && !s.fullSync) {
+		defer s.manageBulkerTimeout(stream.bufferedEventsCount)()
+		state := stream.Commit(false)
+		state.ProcessingTimeSec = time.Since(stream.started).Seconds()
+		if stream.Error != "" {
+			s.postEventsLog(s.syncId, state, stream.processedObjectSample, stream.Error)
+			s.errprint("Stream '%s' bulker commit failed: %v", stream.name, stream.Error)
+		} else {
+			if state.ProcessedRows > 0 || stream.bulkerMode == bulker.ReplaceTable {
+				s.postEventsLog(s.syncId, state, stream.processedObjectSample, "")
+			}
+			s.saveState(stream.name, stream.unsavedState)
+			stream.unsavedState = nil
+			s.log("Stream '%s' bulker commit: %s rows: %d successful: %d", stream.name, state.Status, state.ProcessedRows, state.SuccessfulRows)
+		}
+		s.updateRunningStatus()
+	}
+	return
+}
+
+type BatchState struct {
+	bulker.State  `json:",inline"`
+	LastMappedRow types2.Json `json:"lastMappedRow"`
+}
+
+func (s *ReadSideCar) postEventsLog(destinationId string, state bulker.State, processedObjectSample types2.Json, batchErr string) {
+	if batchErr != "" && state.LastError == nil {
+		state.SetError(errors.New(batchErr))
+	}
+	batchState := BatchState{State: state, LastMappedRow: processedObjectSample}
+	level := eventslog.LevelInfo
+	if batchErr != "" {
+		level = eventslog.LevelError
+	}
+	_, err := s.eventsLogService.PostEvent(&eventslog.ActorEvent{Timestamp: time.Now().UTC(), EventType: eventslog.EventTypeBatch, Level: level, ActorId: destinationId, WorkspaceId: s.workspaceId, Event: batchState})
+	if err != nil {
+		s.errprint("Error posting events log: %v", err)
+	}
+
+}
+
+func (s *ReadSideCar) _closeStream(stream *ActiveStream, complete bool, strict bool) {
+	wasActive := stream.IsActive()
+	defer s.manageBulkerTimeout(stream.bufferedEventsCount)()
+	state := stream.Close(complete, s.cancelled.Load(), strict)
+	state.ProcessingTimeSec = time.Since(stream.started).Seconds()
+	if stream.Error != "" {
+		s.postEventsLog(s.syncId, state, stream.processedObjectSample, stream.Error)
+		s.errprint("Stream '%s' bulker commit failed: %v", stream.name, stream.Error)
+	} else if wasActive {
+		if state.ProcessedRows > 0 || stream.bulkerMode == bulker.ReplaceTable {
+			s.postEventsLog(s.syncId, state, stream.processedObjectSample, "")
+		}
+		s.log("Stream '%s' bulker commit: %s rows: %d successful: %d", stream.name, state.Status, state.ProcessedRows, state.SuccessfulRows)
+	}
+	if complete {
+		s.saveState(stream.name, stream.unsavedState)
+		stream.unsavedState = nil
+	}
+	s.log("Stream '%s' closed: status: %s rows: %d", stream.name, stream.Status, stream.EventsCount)
+}
+
+func (s *ReadSideCar) closeActiveStreams(complete bool) {
+	for _, stream := range s.processedStreams {
+		if stream.Status == "RUNNING" {
+			s._closeStream(stream, complete, true)
+		}
+	}
+}
+
+func (s *ReadSideCar) openStream(streamName string) (*ActiveStream, error) {
+	// we create pipe. everything that is written to 'streamWriter' will be sent to bulker via 'streamReader' as reader payload
+	str, ok := s.catalog.Get(streamName)
+	if !ok {
+		err := fmt.Errorf("stream '%s' is not in catalog", streamName)
+		return &ActiveStream{name: streamName, StreamStat: &StreamStat{Error: err.Error()}}, err
+	}
+	stream := s.processedStreams[streamName]
+	if stream != nil && stream.Error != "" {
+		//for incremental streams we ignore all messages if it was error on previously committed chunks.
+		//error may be on bulker side (source may not know about it) and we have no way to command source to switch to the next stream
+		return stream, nil
+	}
+	if stream != nil && stream.IsActive() {
+		return stream, nil
+	}
+
+	mode := bulker.ReplaceTable
+	// if there is no initial sync state, we assume that this is first sync and we need to do full sync
+	if str.SyncMode == "incremental" && len(s.initialState) > 0 {
+		mode = bulker.Batch
+	} else if stream != nil && stream.EventsCount > 0 {
+		// checkpointing: if there is previous stats that means that we have committed data because and saved state
+		// switch from replace_table to batch mode, to continue adding data to the table
+		mode = bulker.Batch
+	}
+	if stream == nil {
+		stream = NewActiveStream(streamName, str.SyncMode, mode)
+		s.processedStreams[streamName] = stream
+	}
+	s.lastStream = stream
+	var namespace string
+	tableNamePrefix := strings.ReplaceAll(s.tableNamePrefix, "${SOURCE_NAMESPACE}", str.Namespace)
+	// Prefer the source-provided table-name template over the raw stream name:
+	// stream names may contain characters (e.g. "/") that aren't valid table names.
+	defaultTableName := utils.NvlString(str.TableNameTemplate, str.Name)
+	tableName := utils.NvlString(str.TableName, tableNamePrefix+defaultTableName)
+	if s.namespace == "${LEGACY}" {
+		namespace = ""
+		tableName = utils.NvlString(str.TableName, tableNamePrefix+utils.NvlString(str.TableNameTemplate, streamName))
+	} else {
+		namespace = strings.TrimSpace(strings.ReplaceAll(s.namespace, "${SOURCE_NAMESPACE}", str.Namespace))
+	}
+
+	jobId := fmt.Sprintf("%s_%s_%s", s.syncId, s.taskId, tableName)
+
+	var streamOptions []bulker.StreamOption
+	if s.deduplicate && len(str.GetPrimaryKeys()) > 0 {
+		streamOptions = append(streamOptions, bulker.WithPrimaryKey(str.GetPrimaryKeys()...), bulker.WithDeduplicate())
+	}
+	schema := str.ToSchema()
+	//s.log("Schema: %+v", schema)
+	if len(schema.Fields) > 0 {
+		streamOptions = append(streamOptions, bulker.WithSchema(schema))
+	}
+	if len(str.CursorField) > 0 {
+		streamOptions = append(streamOptions, bulker.WithDiscriminatorField(str.CursorField))
+	} else if len(str.DefaultCursorField) > 0 {
+		streamOptions = append(streamOptions, bulker.WithDiscriminatorField(str.DefaultCursorField))
+	}
+
+	streamOptions = append(streamOptions, sql.WithDisableTemporaryTables())
+	if size, ok := forceTemporaryBatchesDestinations[s.blk.Type()]; ok {
+		streamOptions = append(streamOptions, bulker.WithTemporaryBatchSize(size))
+	} else {
+		// during sync we don't use TEMPORARY tables in databases.
+		// that allows us to populate tmp table during long period and through multiple transactions
+		streamOptions = append(streamOptions, bulker.WithTemporaryBatchSize(100000))
+	}
+
+	if namespace != "" {
+		streamOptions = append(streamOptions, bulker.WithNamespace(namespace))
+	}
+	if s.toSameCase {
+		streamOptions = append(streamOptions, bulker.WithToSameCase())
+	}
+	if s.functionsEnv != "" {
+		opt, err := bulker.FunctionsEnvOption.Parse(s.functionsEnv)
+		if err != nil {
+			return stream, fmt.Errorf("error parsing functionsEnv: %v", err)
+		}
+		streamOptions = append(streamOptions, opt)
+	}
+	bulkerStream, err := s.blk.CreateStream(jobId, tableName, mode, streamOptions...)
+	if err != nil {
+		return stream, fmt.Errorf("error creating bulker stream: %v", err)
+	}
+	s.log("Stream '%s' created bulker. table: %s mode: %s primary keys: %s", streamName, tableName, mode, str.GetPrimaryKeys())
+
+	err = stream.Begin(bulkerStream)
+	if err != nil {
+		return stream, fmt.Errorf("error starting bulker stream: %v", err)
+	}
+
+	return stream, nil
+}
+
+func (s *ReadSideCar) processTrace(rec *TraceRow, line string) {
+	switch rec.Type {
+	case "STREAM_STATUS":
+		streamStatus := rec.StreamStatus
+		streamName := joinStrings(streamStatus.StreamDescriptor.Namespace, streamStatus.StreamDescriptor.Name, ".")
+		s.log("Stream '%s' received status: %s", streamName, streamStatus.Status)
+		switch streamStatus.Status {
+		case "STARTED":
+			stream, err := s.openStream(streamName)
+			if err != nil {
+				s.streamErr(stream, "error opening stream: %v", err)
+			}
+			s.updateRunningStatus()
+		case "COMPLETE", "INCOMPLETE":
+			s.closeStream(streamName, streamStatus.Status == "COMPLETE")
+			s.updateRunningStatus()
+		}
+	case "ERROR":
+		r := rec.Error
+		streamName := joinStrings(r.StreamDescriptor.Namespace, r.StreamDescriptor.Name, ".")
+		if streamName != "" {
+			s.errprint("TRACE ERROR '%s': %s", streamName, r.Message)
+		} else {
+			s.errprint("TRACE ERROR: %s", r.Message)
+		}
+		s.log("ERROR DETAILS: %+v", r)
+		errMsg := r.Message
+		if (errMsg == somethingWentWrongError || errMsg == "") && r.InternalMessage != "" {
+			errMsg = r.InternalMessage
+		}
+		streamErr := errMsg
+		if streamName != "" {
+			stream, ok := s.processedStreams[streamName]
+			if ok {
+				if (streamErr == somethingWentWrongError || streamErr == "") && stream.errorFromLogs != "" {
+					streamErr = stream.errorFromLogs
+				}
+				stream.RegisterError(fmt.Errorf("%s", streamErr))
+			}
+		} else {
+			if errMsg != somethingWentWrongError && errMsg != "" {
+				s.firstErr = fmt.Errorf("%s", errMsg)
+			} else if s.firstErr == nil {
+				s.firstErr = fmt.Errorf("%s", streamErr)
+			}
+		}
+	default:
+		s.log("TRACE: %s", line)
+	}
+}
+
+func (s *ReadSideCar) processRecord(rec *RecordRow, size int) {
+	streamName := joinStrings(rec.Namespace, rec.Stream, ".")
+	stream, err := s.openStream(streamName)
+	if err != nil {
+		s.streamErr(stream, "error opening stream: %v", err)
+		return
+	}
+	row := rec.Data
+	if s.addMeta {
+		row.Set("_jitsu_timestamp", time.Now().UTC().Format(timestamp.JsonISO))
+	}
+	// Mark downstream as busy around Consume so the watchdog doesn't false-fire
+	// when a slow destination causes the bulker buffer to back up: scanner.Scan
+	// stops iterating, lastMessageTime freezes, and the source ends up blocked
+	// in write(2) — yet the container appears "running" externally.
+	// processRecordStart bounds a genuine stall: the watchdog panics with a
+	// specific message if Consume holds for >2h.
+	s.processRecordStart.Store(time.Now().Unix())
+	s.downstreamBusy.Add(1)
+	defer func() {
+		s.lastMessageTime.Store(time.Now().Unix())
+		s.processRecordStart.Store(0)
+		s.downstreamBusy.Add(-1)
+	}()
+	err = stream.Consume(rec.Data, size)
+	if err != nil {
+		s.streamErr(stream, "error producing to bulker stream: %v", err)
+		return
+	}
+}
+
+func (s *ReadSideCar) sourceLog(level, message string, args ...any) {
+	s.AbstractSideCar.sourceLog(level, message, args...)
+}
+
+func (s *ReadSideCar) streamErr(stream *ActiveStream, message string, args ...any) {
+	err := fmt.Errorf(message, args...)
+	stream.RegisterError(err)
+	s._log("jitsu", "ERROR", err.Error())
+}
+
+func (s *ReadSideCar) errprint(message string, args ...any) {
+	text := fmt.Sprintf(message, args...)
+	s._log("jitsu", "ERROR", text)
+}
+
+func (s *ReadSideCar) panic(message string, args ...any) {
+	s.lastStream.RegisterError(fmt.Errorf(message, args...))
+	s.AbstractSideCar.panic(message, args...)
+}
+
+// isPermanentPgError reports whether a Postgres failure will still be a failure
+// on the next attempt.
+//
+// The statements this sidecar runs are static and known-good — three upserts
+// against our own control plane. A syntax error or a constraint violation here
+// is a deploy-time bug, not a runtime condition, and retrying it for two
+// minutes turns a clear failure into a slow, confusing one. Everything else a
+// sidecar realistically meets is infrastructure: a dialled connection refused
+// while the primary moves, a demoted primary answering read-only, a node
+// draining. Those are worth waiting out.
+//
+// So the list is what must NOT be retried, and anything unrecognised is
+// retried. Classified on SQLSTATE rather than the message because Postgres
+// localizes messages but never SQLSTATEs (same reasoning as
+// bulkerapp/app/batch_consumer.go). errors.As works here because
+// db.execTimeout returns the driver error unwrapped.
+func isPermanentPgError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		// Not a Postgres-level error at all: a dial failure, a reset, an EOF.
+		// That is precisely the failover case.
+		return false
+	}
+	switch pgErr.Code[:2] {
+	case "22", // data exception
+		"23", // integrity constraint violation
+		"28", // invalid authorization specification
+		"42": // syntax error or access rule violation
+		return true
+	}
+	return pgErr.Code == "3D000" // invalid catalog name
+}
+
+// poolPingTimeout bounds the reachability check on each pool-creation attempt.
+// Long enough to ride out a slow dial, short enough that ten attempts plus
+// their backoff stay well inside a sync's startup.
+const poolPingTimeout = 10 * time.Second
+
+// retryBudget bounds a whole retry sequence in wall-clock time, independently
+// of how many attempts are left. It exists because attempts are not a bound on
+// their own — see retryControlPlaneWrite. A var rather than a const only so
+// tests can shrink it; nothing in the sidecar reassigns it.
+var retryBudget = 5 * time.Minute
+
+// retryCancelledBudget bounds retries once the sidecar has been told to stop.
+// SIGTERM starts Kubernetes' termination grace period — 30s by default — so
+// sitting on the full retryBudget would get the pod SIGKILLed mid-sleep. A few
+// seconds is still enough for a brief blip to record the final status.
+var retryCancelledBudget = 5 * time.Second
+
+// retryCancelledDelay caps the backoff once cancelled. A sleep already under
+// way cannot be interrupted, so a 30s step would blow the shutdown budget in
+// one go however tight that budget is.
+var retryCancelledDelay = 1 * time.Second
+
+// retryControlPlaneWrite runs a write against our own control-plane Postgres,
+// retrying transient failures instead of killing the customer's sync.
+//
+// Why this exists: replacing the node that holds the CNPG primary means a
+// replica has to be promoted, and for that window jitsu-pg-rw has no writable
+// endpoint — the write fails with "connect: connection refused". Before this,
+// one such failure panicked the sidecar and the sync was marked FAILED. Seen
+// twice, 12 and 19 Sep 2026, both inside the cluster's weekend maintenance
+// window. The PodDisruptionBudgets are already correct; the window is inherent
+// to failover, so any node replacement reproduces it.
+//
+// The budget deliberately exceeds the observed outage. Blocking here is safe:
+// storeState holds downstreamBusy across the call so the stuck-source watchdog
+// cannot misfire while we wait, and every write is already bounded at two
+// minutes by execTimeout in the db package, which wraps each Exec in a context
+// deadline — that covers acquiring and dialling a connection, not only
+// statement execution, so a single attempt cannot hang indefinitely. (The
+// pool's server-side statement_timeout does not give us this: it only applies
+// once a session exists, so it does nothing for a dial that never completes.)
+//
+// An attempt count alone is still not a bound. Ten attempts each sitting on
+// that two-minute ceiling is twenty minutes of blocking for a failover window
+// that lasts about one, so retryBudget bounds the sequence in wall-clock time
+// as well: we never begin a sleep that would carry us past it. Worst case is
+// therefore retryBudget plus one attempt ceiling — about 7 minutes rather than
+// about 22. The ordinary case is untouched, because a refused connection
+// returns immediately and all ten attempts fit inside the ~121s of backoff.
+//
+// Shutdown is the third bound. SIGTERM sets s.cancelled and starts the
+// termination grace period, and the deferred block in Run() then tries to
+// write CANCELLED status — through here. Retrying that for five minutes would
+// outlive the grace period and get the pod SIGKILLed mid-sleep, so once
+// cancelled the sequence is held to retryCancelledBudget with a shorter step.
+// Not zero: a cancel that lands during a brief blip should still record its
+// status.
+//
+// Whichever bound runs out, the sync still fails — this trades a certain
+// failure for a very likely recovery, not for a hang.
+// sleepCancellable waits for d, returning early if the sidecar is asked to
+// stop. Without this a SIGTERM arriving just after the cancelled check leaves
+// us asleep for the rest of the current step — up to 30s, longer than the
+// grace period on its own.
+//
+// Close only flips an atomic, so there is no channel to select on and this
+// polls. A 100ms tick is invisible next to the steps it interrupts and far
+// below any grace period worth honouring.
+func (s *ReadSideCar) sleepCancellable(d time.Duration) {
+	const tick = 100 * time.Millisecond
+	deadline := time.Now().Add(d)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || s.cancelled.Load() {
+			return
+		}
+		if remaining < tick {
+			time.Sleep(remaining)
+			return
+		}
+		time.Sleep(tick)
+	}
+}
+
+func (s *ReadSideCar) retryControlPlaneWrite(what string, op func() error) {
+	const attempts = 10
+	const maxDelay = 30 * time.Second
+	delay := 500 * time.Millisecond
+	deadline := time.Now().Add(retryBudget)
+	var cancelDeadline time.Time
+	var err error
+	for i := 1; i <= attempts; i++ {
+		if err = op(); err == nil {
+			if i > 1 {
+				s.log("%s recovered after %d attempts", what, i)
+			}
+			return
+		}
+		if isPermanentPgError(err) {
+			s.panic("%s: %v", what, err)
+		}
+		if i == attempts {
+			break
+		}
+		if s.cancelled.Load() {
+			if cancelDeadline.IsZero() {
+				cancelDeadline = time.Now().Add(retryCancelledBudget)
+			}
+			if delay > retryCancelledDelay {
+				delay = retryCancelledDelay
+			}
+			if deadline.After(cancelDeadline) {
+				deadline = cancelDeadline
+			}
+		}
+		if time.Now().Add(delay).After(deadline) {
+			if !cancelDeadline.IsZero() {
+				s.panic("%s: giving up, the sidecar is shutting down (attempt %d/%d): %v", what, i, attempts, err)
+			}
+			s.panic("%s: giving up after %s of retries (attempt %d/%d): %v", what, retryBudget, i, attempts, err)
+		}
+		// Deliberately not s.log. Logging routes through _log, which for task
+		// logs hits ClickHouse when an events-log service is configured and
+		// falls back to db.InsertTaskLog on this same pool when it is not — so
+		// on a self-hosted install every retry line would be a second doomed
+		// round-trip to the Postgres that just refused the write. Printing to
+		// stdout costs nothing on either path; the sidecar relays it regardless.
+		fmt.Printf("WARN : %s failed (attempt %d/%d), retrying in %s: %v\n", what, i, attempts, delay, err)
+		if cancelDeadline.IsZero() {
+			// Not cancelled yet, so this step may be long: wake early if a
+			// SIGTERM lands in the middle of it.
+			s.sleepCancellable(delay)
+		} else {
+			// Already cancelled. delay is capped at retryCancelledDelay here,
+			// and this spacing is the point — returning immediately would burn
+			// the remaining attempts in a hot loop and retry nothing.
+			time.Sleep(delay)
+		}
+		if delay < maxDelay {
+			if delay *= 2; delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+	s.panic("%s after %d attempts: %v", what, attempts, err)
+}
+
+func (s *ReadSideCar) storeState(stream, state string) {
+	// Same gate as processRecord: a slow Postgres write here can otherwise
+	// freeze lastMessageTime while the stdout reader is parked on the DB,
+	// the source backs up on its FIFO, and the watchdog misreads the
+	// silence as a dead source. No separate stuck-call watchdog needed
+	// here — the dbpool's 2-minute statement_timeout bounds the call.
+	s.downstreamBusy.Add(1)
+	defer func() {
+		s.lastMessageTime.Store(time.Now().Unix())
+		s.downstreamBusy.Add(-1)
+	}()
+	s.retryControlPlaneWrite("error updating state", func() error {
+		return db.UpsertState(s.dbpool, s.syncId, stream, state, time.Now())
+	})
+}
+
+func (s *ReadSideCar) updateRunningStatus() {
+	statusMap := jsonorder.NewOrderedMap[string, any](0)
+	s.catalog.ForEach(func(streamName string, _ *Stream) {
+		if stream, ok := s.processedStreams[streamName]; ok {
+			statusMap.Set(streamName, stream.StreamStat)
+		} else {
+			statusMap.Set(streamName, &StreamStat{Status: "PENDING"})
+		}
+	})
+	processedStreamsJson, _ := jsonorder.Marshal(statusMap)
+	s.sendGoodStatus("RUNNING", string(processedStreamsJson), "", false)
+}
+
+func (s *ReadSideCar) sendBadStatus(status string, errMsg string) {
+	s.errprint("READ %s", joinStrings(status, errMsg, ": "))
+	s.retryControlPlaneWrite("error updating task", func() error {
+		return db.UpsertTaskError(s.dbpool, s.syncId, s.taskId, s.packageName, s.packageVersion, s.startedAt, status, errMsg)
+	})
+}
+
+func (s *ReadSideCar) sendGoodStatus(status string, description, errMsg string, log bool) {
+	if log {
+		s.log("READ %s", joinStrings(status, description, ": "))
+	}
+	s.retryControlPlaneWrite("error updating task", func() error {
+		return db.UpsertTaskDescriptionAndError(s.dbpool, s.syncId, s.taskId, s.packageName, s.packageVersion, s.startedAt, status, description, errMsg)
+	})
+}
+
+// configsPath returns the directory that holds catalog.json, state.json
+// and destinationConfig.json for the current run.
+//
+//   - Default ("/config")   : Secret mount used by the legacy reactive flow.
+//   - CONFIGS_PATH overrides : CronJob-driven runs set it to "/shared",
+//     an emptyDir written by the oauth-refresh + load-catalog-state init
+//     containers (so all run-time inputs sit in one directory regardless
+//     of how they got there).
+func configsPath() string {
+	if p := os.Getenv("CONFIGS_PATH"); p != "" {
+		return strings.TrimRight(p, "/")
+	}
+	return "/config"
+}
+
+func (s *ReadSideCar) loadState() (string, bool) {
+	statePath := configsPath() + "/state.json"
+	if _, err := os.Stat(statePath); os.IsNotExist(err) {
+		return "", false
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		return "", false
+	}
+	st := strings.TrimSpace(string(state))
+	// Treat empty / {} / [] as "no state". `[]` matters for the autonomous
+	// CronJob path where the load-catalog-state init writes a JSON document
+	// regardless of whether any source_state rows existed.
+	if len(st) == 0 || st == "{}" || st == "[]" {
+		return "", false
+	}
+	s.initialState = st
+	return st, true
+}
+
+func (s *ReadSideCar) loadCatalog() error {
+	catalogPath := configsPath() + "/catalog.json"
+	if _, err := os.Stat(catalogPath); os.IsNotExist(err) {
+		return fmt.Errorf("catalog file %s doesn't exist", catalogPath)
+	}
+	catalogFile, err := os.ReadFile(catalogPath)
+	if err != nil {
+		return fmt.Errorf("error opening catalog file: %v", err)
+	}
+	//s.log("Catalog: %s", string(catalogFile))
+	catalog := Catalog{}
+	err = jsonorder.Unmarshal(catalogFile, &catalog)
+	if err != nil {
+		return fmt.Errorf("error parsing catalog file: %v", err)
+	}
+	mp := jsonorder.NewOrderedMap[string, *Stream](len(catalog.Streams))
+	for _, stream := range catalog.Streams {
+		mp.Set(joinStrings(stream.Namespace, stream.Name, "."), stream)
+	}
+	s.catalog = mp
+	return nil
+}
+
+func (s *ReadSideCar) loadDestinationConfig() error {
+	destinationConfigPath := configsPath() + "/destinationConfig.json"
+	if _, err := os.Stat(destinationConfigPath); os.IsNotExist(err) {
+		return fmt.Errorf("destination config file %s doesn't exist", destinationConfigPath)
+	}
+	destinationConfigFile, err := os.ReadFile(destinationConfigPath)
+	if err != nil {
+		return fmt.Errorf("error opening destination config file: %v", err)
+	}
+	//s.log("Destination config: %s", string(destinationConfigFile))
+	var destinationConfig map[string]any
+	err = jsonorder.Unmarshal(destinationConfigFile, &destinationConfig)
+	if err != nil {
+		return fmt.Errorf("error parsing destination config file: %v", err)
+	}
+	s.destinationConfig = destinationConfig
+	return nil
+}
+
+// isCriticalError returns true if first error occurred during sync run
+// and we consider it as valid reason to tread all streams that haven't received COMPLETE status as FAILED
+func (s *ReadSideCar) isCriticalError() bool {
+	return s.isErr() && s.packageName != "airbyte/source-netsuite"
+}
+
+type StreamStat struct {
+	EventsCount    int    `json:"events"`
+	BytesProcessed int    `json:"bytes"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
+}
+
+type ActiveStream struct {
+	name                string
+	mode                string
+	bulkerMode          bulker.BulkMode
+	bufferedEventsCount int
+	bufferedBytes       int
+	unsavedState        any
+	closed              bool
+
+	bulkerStream          bulker.BulkerStream
+	processedObjectSample types2.Json
+	started               time.Time
+	errorFromLogs         string
+	noTrustworthyError    bool
+	*StreamStat
+}
+
+func NewActiveStream(name, mode string, bulkerMode bulker.BulkMode) *ActiveStream {
+	return &ActiveStream{name: name, mode: mode, bulkerMode: bulkerMode, StreamStat: &StreamStat{Status: "RUNNING"}}
+}
+
+func (s *ActiveStream) Begin(bulkerStream bulker.BulkerStream) error {
+	if s.closed {
+		return fmt.Errorf("Stream '%s' is already closed", s.name)
+	}
+	if s.bulkerStream != nil {
+		return fmt.Errorf("Stream '%s' is already started", s.name)
+	}
+	s.bulkerStream = bulkerStream
+	s.Status = "RUNNING"
+	s.started = time.Now()
+	return nil
+}
+
+func (s *ActiveStream) Abort() (state bulker.State) {
+	if s == nil {
+		return
+	}
+	if s.bulkerStream != nil {
+		state = s.bulkerStream.Abort(context.Background())
+	}
+	s.bulkerStream = nil
+	return
+}
+
+// Commit strict - if true, we commit only if there are no errors in logs that could be attributed to that stream
+// ( was emitted when only this stream was running )
+func (s *ActiveStream) Commit(strict bool) (state bulker.State) {
+	if s == nil {
+		return
+	}
+	if s.bulkerStream != nil {
+		if s.Error != "" {
+			state = s.bulkerStream.Abort(context.Background())
+		} else if strict && s.errorFromLogs != "" {
+			s.Error = s.errorFromLogs
+			state = s.bulkerStream.Abort(context.Background())
+		} else {
+			var err error
+			state, err = s.bulkerStream.Complete(context.Background())
+			if err != nil {
+				s.Error = err.Error()
+			} else {
+				s.EventsCount += s.bufferedEventsCount
+				s.BytesProcessed += s.bufferedBytes
+			}
+		}
+	}
+	s.bufferedEventsCount = 0
+	s.bufferedBytes = 0
+	s.bulkerStream = nil
+	return
+}
+
+func (s *ActiveStream) Close(complete, cancelled, strict bool) (state bulker.State) {
+	if complete {
+		state = s.Commit(strict)
+	} else {
+		state = s.Abort()
+		if s.Error == "" && !cancelled {
+			s.Error = utils.NvlString(s.errorFromLogs, interruptError)
+			s.noTrustworthyError = true
+		}
+	}
+	if s.Error != "" {
+		if s.EventsCount > 0 {
+			s.Status = "PARTIAL"
+		} else {
+			s.Status = "FAILED"
+		}
+	} else if cancelled {
+		if s.EventsCount > 0 {
+			s.Status = "PARTIAL"
+			s.Error = cancelledError
+		} else {
+			s.Status = "CANCELLED"
+		}
+	} else if s.Status == "RUNNING" {
+		s.Status = "SUCCESS"
+	}
+	s.closed = true
+	return
+}
+
+func (s *ActiveStream) Consume(p *jsonorder.OrderedMap[string, any], originalSize int) error {
+	if s.Error != "" {
+		return nil
+	}
+	var err error
+	_, s.processedObjectSample, err = s.bulkerStream.Consume(context.Background(), p)
+	if err == nil {
+		s.bufferedEventsCount++
+		s.bufferedBytes += originalSize
+	}
+	return err
+}
+
+func (s *ActiveStream) IsActive() bool {
+	return s.bulkerStream != nil && s.Error == ""
+}
+
+func (s *ActiveStream) RegisterError(err error) {
+	if err != nil && s != nil && (s.Error == "" || s.noTrustworthyError) {
+		s.Error = err.Error()
+		s.bufferedEventsCount = 0
+		s.bufferedBytes = 0
+	}
+}
+
+// relayInitContainerLogs surfaces output produced by the discover init
+// container (and any other init that opts in via `/shared/init-<name>.log`)
+// into task_log via the standard sidecar logging path.
+//
+// Three sources are handled:
+//
+//   - /shared/discover.stderr: discover's bare stderr (only errors / unparsed
+//     output by airbyte convention). Emitted at level STDERR.
+//   - /shared/discover.jsonl: discover's stdout as AirbyteMessage JSONL. LOG
+//     and TRACE messages are dispatched the same way read.go does it. The
+//     CATALOG message is intentionally skipped — load-catalog-state already
+//     persisted it and the payload is large.
+//   - /shared/init-<name>.log: plain text from any other init container,
+//     emitted at INFO under logger=<name>.
+//
+// Best-effort: read errors are logged and don't fail the read task. Note
+// that if discover *failed* this sidecar wouldn't be running (init chain
+// stops on first non-zero exit), so this code only runs on the post-success
+// path.
+func (s *ReadSideCar) relayInitContainerLogs() {
+	s.relayDiscoverStderr("/shared/discover.stderr")
+	s.relayDiscoverJsonl("/shared/discover.jsonl")
+
+	// Convention: any other init can drop `/shared/init-<name>.log` and it
+	// gets relayed under logger=<name>.
+	matches, _ := filepath.Glob("/shared/init-*.log")
+	for _, p := range matches {
+		base := filepath.Base(p)
+		name := strings.TrimSuffix(strings.TrimPrefix(base, "init-"), ".log")
+		if name == "" {
+			name = base
+		}
+		s.relayPlainLines(p, name, "INFO")
+	}
+}
+
+// relayPlainLines emits each non-empty line from `path` as a task_log entry
+// under (logger, level). Used for generic init-<name>.log artifacts.
+func (s *ReadSideCar) relayPlainLines(path, logger, level string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			continue
+		}
+		s._log(logger, level, line)
+	}
+}
+
+// relayDiscoverStderr re-emits each non-empty line of discover's stderr.
+// Airbyte connectors generally write only errors/unparseable output here, so
+// level STDERR matches the spec_catalog convention for stderr stream content.
+func (s *ReadSideCar) relayDiscoverStderr(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			continue
+		}
+		s._log(s.packageName, "STDERR", line)
+	}
+}
+
+// relayDiscoverJsonl parses discover's stdout (airbyte JSONL) and re-emits
+// LOG / TRACE messages the same way read.go's main loop handles them.
+// Non-message lines (or lines that fail JSON parse) fall back to checkJsonRow
+// so prefix-style "INFO foo" output still gets logged. The CATALOG message
+// is skipped (load-catalog-state persisted it; payload is too large for a
+// single task_log row).
+func (s *ReadSideCar) relayDiscoverJsonl(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		lineStr := strings.TrimSpace(string(line))
+		if lineStr == "" {
+			continue
+		}
+		// Non-JSON / prefix-style lines: routed through the same fallback the
+		// main read loop uses (logs unprefixed text at ERROR, prefixed text
+		// at the prefix's level).
+		if !strings.HasPrefix(lineStr, "{") {
+			s.checkJsonRow(lineStr)
+			continue
+		}
+		row := &Row{}
+		if err := jsonorder.Unmarshal(line, row); err != nil {
+			s._log(s.packageName, "WARN", fmt.Sprintf("error parsing discover.jsonl line: %v: %s", err, lineStr))
+			continue
+		}
+		switch row.Type {
+		case LogType:
+			if row.Log != nil {
+				level := strings.ToUpper(row.Log.Level)
+				if level == "" {
+					level = "INFO"
+				}
+				s._log(s.packageName, level, row.Log.Message)
+			}
+		case TraceType:
+			if row.Trace == nil {
+				continue
+			}
+			if row.Trace.Type == "ERROR" {
+				msg := row.Trace.Error.Message
+				if msg == "" {
+					msg = row.Trace.Error.InternalMessage
+				}
+				s._log(s.packageName, "ERROR", msg)
+				if row.Trace.Error.StackTrace != "" {
+					s._log(s.packageName, "DEBUG", row.Trace.Error.StackTrace)
+				}
+			} else {
+				s._log(s.packageName, "DEBUG", lineStr)
+			}
+		case CatalogType:
+			// Already persisted by load-catalog-state; skip to avoid a huge
+			// task_log row.
+		case ControlType:
+			s._log(s.packageName, "DEBUG", lineStr)
+		default:
+			// Unexpected for discover (RECORD/STATE/SPEC/CONNECTION_STATUS).
+			s._log(s.packageName, "DEBUG", lineStr)
+		}
+	}
+}

@@ -1,0 +1,90 @@
+{{- if gt (int .Values.scaling.profiles.replicas) 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profiles
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: profiles
+spec:
+  replicas: {{ .Values.scaling.profiles.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: profiles
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: profiles
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: profiles
+          image: node:24-bookworm
+          workingDir: /cache/workspace/services/rotor
+          command: ["npx", "tsx", "--no-node-snapshot", "--max-old-space-size=2048", "src/index.ts"]
+          ports:
+            - name: http
+              containerPort: 3401
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: jitsu-secrets
+            # Connection URLs of the in-cluster dependencies (helm-deps chart).
+            # Listed after jitsu-secrets so its keys win over any legacy URL
+            # keys there; explicit env entries below still take precedence.
+            - secretRef:
+                name: jitsu-deps-urls
+                optional: true
+          env:
+            {{- include "jitsu-dev.env" (dict "ctx" . "service" "profiles"
+                  "extra" (dict
+                    "ROTOR_MODE" "profiles"
+                    "MONGODB_TIMEOUT_MS" "120000"
+                    "WAREHOUSE_TIMEOUT_MS" "5000"
+                    "UDF_TIMEOUT_MS" "300000")) | nindent 12 }}
+          volumeMounts:
+            - name: node-cache
+              mountPath: /cache
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: node-cache
+          persistentVolumeClaim:
+            claimName: node-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profiles
+  labels:
+    {{- include "jitsu-dev.labels" . | nindent 4 }}
+    app.kubernetes.io/name: profiles
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3401
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: profiles
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

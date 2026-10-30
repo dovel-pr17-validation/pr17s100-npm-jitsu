@@ -1,0 +1,359 @@
+import GithubProvider from "next-auth/providers/github";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { NextAuthOptions, User } from "next-auth";
+import { db } from "./server/db";
+import { OIDCProvider, ParseJSONConfigFromEnv } from "./oidc";
+import { checkHash, requireDefined } from "juava";
+import { ApiError } from "./shared/errors";
+import { getServerLog } from "./server/log";
+import { trackAuthEvent, withProductAnalytics } from "./server/telemetry";
+import { NextApiRequest } from "next";
+import { onUserCreated } from "./server/ee";
+import { ensureNextAuthUrl, getServerEnv } from "./server/serverEnv";
+import { authAuditLog } from "./server/audit-log";
+import { getPublicOrigin } from "./server/origin";
+
+const crypto = require("crypto");
+
+const log = getServerLog("auth");
+
+// next-auth's own origin detection (utils/detect-origin.js) reads
+// process.env.NEXTAUTH_URL directly and, failing that, only falls back to
+// the request's Host header when VERCEL or AUTH_TRUST_HOST is set — neither
+// is true on our GKE deployments. Left unset, every /api/auth/* response
+// (signin redirects, cookies, the providers endpoint) defaults to a literal
+// http://localhost:3000, and useSecureCookies below stays false in
+// production. Falling back to the same canonical URL the rest of the app
+// already uses for this (see getPublicOrigin) fixes both without requiring
+// a new env var anywhere self-hosted deployments aren't already setting.
+ensureNextAuthUrl(getPublicOrigin());
+
+const serverEnv = getServerEnv();
+
+export const githubLoginEnabled = !!serverEnv.GITHUB_CLIENT_ID;
+export const oidcLoginEnabled = !!serverEnv.AUTH_OIDC_PROVIDER;
+export const oidcLoginConfig = ParseJSONConfigFromEnv(serverEnv.AUTH_OIDC_PROVIDER as string);
+export const credentialsLoginEnabled =
+  serverEnv.ENABLE_CREDENTIALS_LOGIN || !!(serverEnv.SEED_USER_EMAIL && serverEnv.SEED_USER_PASSWORD);
+
+// next-auth wraps any error from the token exchange / userinfo fetch into a
+// bare OAuthCallbackError before it reaches our logger, dropping the
+// underlying openid-client OPError's `.response` (status, body, request url)
+// in the process — so a real GitHub-side failure shows up in logs as just
+// "expected 200 OK, got: 500 Internal Server Error" with no way to tell which
+// call failed or what GitHub actually said. Log it here, before next-auth
+// gets a chance to discard it.
+function logOAuthHttpError(step: "token-exchange" | "userinfo", error: any) {
+  const response = error?.response;
+  log.atError().log(`GitHub OAuth ${step} failed`, {
+    status: response?.statusCode,
+    url: response?.url,
+    body: response?.body,
+    message: error?.message,
+  });
+}
+
+const githubProvider = githubLoginEnabled
+  ? (() => {
+      const base = GithubProvider({
+        clientId: serverEnv.GITHUB_CLIENT_ID as string,
+        clientSecret: serverEnv.GITHUB_CLIENT_SECRET as string,
+      });
+      return {
+        ...base,
+        token: {
+          url: "https://github.com/login/oauth/access_token",
+          async request({ provider, params, checks, client }) {
+            try {
+              const tokens = await client.oauthCallback(provider.callbackUrl, params, checks);
+              return { tokens };
+            } catch (error) {
+              logOAuthHttpError("token-exchange", error);
+              throw error;
+            }
+          },
+        },
+        userinfo: {
+          url: "https://api.github.com/user",
+          async request({ client, tokens }) {
+            let profile;
+            try {
+              profile = await client.userinfo(tokens.access_token as string);
+            } catch (error) {
+              logOAuthHttpError("userinfo", error);
+              throw error;
+            }
+            if (!profile.email) {
+              const res = await fetch("https://api.github.com/user/emails", {
+                headers: { Authorization: `token ${tokens.access_token}` },
+              });
+              if (res.ok) {
+                const emails = await res.json();
+                profile.email = (emails.find((e: any) => e.primary) ?? emails[0])?.email;
+              } else {
+                log.atWarn().log("GitHub /user/emails fetch failed", { status: res.status });
+              }
+            }
+            return profile;
+          },
+        },
+      };
+    })()
+  : undefined;
+
+const oidcProvider = oidcLoginConfig ? OIDCProvider(oidcLoginConfig) : undefined;
+
+const credentialsProvider =
+  credentialsLoginEnabled &&
+  CredentialsProvider({
+    authorize: async function (credentials) {
+      if (!credentials) {
+        log.atWarn().log(`Failed attempt to login with empty credentials`);
+        return null;
+      }
+      const username = credentials.username;
+      if (!username) {
+        throw new ApiError("Username is not defined");
+      }
+      const user = await db.prisma().userProfile.findFirst({ where: { email: username }, include: { password: true } });
+      if (!user) {
+        log.atDebug().log(`Attempt to login with unknown user: ${username}`);
+      } else if (user.password && checkHash(user.password.hash, credentials.password)) {
+        log.atDebug().log(`User ${username} logged in successfully with password`);
+        return {
+          id: user.id,
+          externalId: user.externalId,
+          email: user.email,
+          name: user.name,
+        };
+      }
+      if (!user) {
+        log.atWarn().log(`Can't proceed with login, ${username} not found`);
+      } else if (!user.password) {
+        log.atWarn().log(`Can't proceed with login, ${username} doesn't have a password`);
+      } else {
+        log.atDebug().log(`Unsuccessful login attempt: user ${username} exists, but password is invalid`);
+      }
+      return null;
+    },
+    credentials: {
+      username: { label: "Email", type: "text" },
+      password: { label: "Password", type: "password" },
+    },
+  });
+
+export async function getOrCreateUser(opts: {
+  externalId: string;
+  loginProvider: string;
+  name?: string;
+  email: string;
+  // we only need this for product analytics, so it's optional
+  req?: NextApiRequest;
+}): Promise<User & { loginProvider: string; externalId: string; admin: boolean | null; mustChangePassword: boolean }> {
+  const { externalId, loginProvider, email, name = email } = opts;
+  let user = await db.prisma().userProfile.findFirst({
+    where: { externalId, loginProvider },
+    include: { password: true },
+  });
+  if (!user) {
+    if (serverEnv.DISABLE_SIGNUP) {
+      throw new ApiError("Sign up is disabled", { responseObject: { code: "signup-disabled" } });
+    }
+    //first user is admin
+    const admin = !(await db.prisma().userProfile.count());
+    user = await db.prisma().userProfile.create({
+      data: {
+        //we need this to be consistent with id generated by .authorize() call
+        id: loginProvider === "credentials" ? externalId : undefined,
+        email,
+        name,
+        externalId: externalId,
+        loginProvider: loginProvider,
+        admin,
+      },
+      include: {
+        password: true,
+      },
+    });
+    await withProductAnalytics(p => p.track("user_created"), {
+      user: { email, name, internalId: user.id, externalId, loginProvider },
+      req: opts.req,
+    });
+    await onUserCreated({ email, name });
+  } else if (user.name !== name || user.email !== email) {
+    await db.prisma().userProfile.update({ where: { id: user.id }, data: { name, email } });
+    // Re-fetch to get updated data with password relation
+    user = await db.prisma().userProfile.findFirst({
+      where: { id: user.id },
+      include: { password: true },
+    });
+    if (!user) {
+      throw new ApiError("User not found after update");
+    }
+  }
+  return {
+    ...user,
+    mustChangePassword: user.password?.changeAtNextLogin ?? false,
+  };
+}
+
+function generateSecret(base: (string | undefined)[]) {
+  const hash = crypto.createHash("sha256");
+  hash.update(base.map(s => s || "empty").join(":"));
+  const secretKey = hash.digest("hex");
+  log.atInfo().log("Using autogenerated JWT key", secretKey);
+  return secretKey;
+}
+
+const authCookieDomain = serverEnv.AUTH_COOKIE_DOMAIN;
+// Safe to read via serverEnv here: ensureNextAuthUrl() above invalidates the
+// memoized cache when it sets the var, so this getServerEnv() call (line 34)
+// already re-parsed with the fallback applied.
+const useSecureCookies = !!serverEnv.NEXTAUTH_URL?.startsWith("https://");
+
+const sharedCookieOptions = authCookieDomain
+  ? {
+      cookies: {
+        sessionToken: {
+          name: useSecureCookies ? "__Secure-next-auth.session-token" : "next-auth.session-token",
+          options: {
+            httpOnly: true,
+            sameSite: "lax" as const,
+            path: "/",
+            secure: useSecureCookies,
+            domain: authCookieDomain,
+          },
+        },
+        callbackUrl: {
+          name: useSecureCookies ? "__Secure-next-auth.callback-url" : "next-auth.callback-url",
+          options: { sameSite: "lax" as const, path: "/", secure: useSecureCookies, domain: authCookieDomain },
+        },
+        csrfToken: {
+          // CSRF cookie cannot use the __Host- prefix because that prefix forbids `domain`.
+          name: useSecureCookies ? "__Secure-next-auth.csrf-token" : "next-auth.csrf-token",
+          options: {
+            httpOnly: true,
+            sameSite: "lax" as const,
+            path: "/",
+            secure: useSecureCookies,
+            domain: authCookieDomain,
+          },
+        },
+      },
+    }
+  : {};
+
+// Computed once at module load. Must NOT live inside buildNextAuthConfig:
+// generateSecret logs the generated key, and the config is now rebuilt per
+// auth request, so computing it there would re-log the signing secret on every
+// /api/auth/* hit (and re-hash needlessly). If JWT_SECRET is unset we derive a
+// stable secret from installation-unique values.
+const nextAuthSecret =
+  serverEnv.JWT_SECRET ||
+  generateSecret(["v2", serverEnv.GITHUB_CLIENT_ID, serverEnv.GOOGLE_CLIENT_ID, serverEnv.DATABASE_URL]);
+
+// Built as a factory so the NextAuth handler can pass the current request in
+// (via NextAuth(req, res, options)); the signOut/jwt events then attribute
+// their login/logout audit rows to the request's ip + headers. `req` is
+// optional: the static export below (used by getServerSession and `.secret`
+// consumers) builds it without one, which is fine since those paths never fire
+// the login/logout events.
+function buildNextAuthConfig(req?: NextApiRequest): NextAuthOptions {
+  return {
+    // Configure one or more authentication providers
+    providers: [githubProvider, oidcProvider, credentialsProvider].filter(provider => !!provider) as any,
+    pages: {
+      error: "/error/auth", // Error code passed in query string as ?error=
+      signIn: "/signin", // Displays signin buttons
+    },
+    ...sharedCookieOptions,
+
+    secret: nextAuthSecret,
+    events: {
+      signOut: async ({ token }) => {
+        try {
+          const internalId = token?.internalId as string | undefined;
+          const email = (token?.email as string | undefined) || "";
+          const name = (token?.name as string | undefined) || email;
+          const loginProvider = (token?.loginProvider as string | undefined) || "credentials";
+          if (internalId) {
+            await authAuditLog({ internalId, email, name }, "logout", `nextauth-${loginProvider}`, undefined, req);
+            await trackAuthEvent(
+              // Read the persisted externalId (what the jwt/session callbacks treat as
+              // canonical), not token.sub — for some providers sub diverges from the
+              // stored external id, which would overwrite the identify trait with the wrong value.
+              { internalId, email, name, externalId: token?.externalId as string | undefined },
+              "logout",
+              `nextauth-${loginProvider}`
+            );
+          }
+        } catch (err) {
+          log.atError().withCause(err).log("Failed to record logout audit event");
+        }
+      },
+    },
+    callbacks: {
+      jwt: async props => {
+        const loginProvider = (props.account?.provider || props.token.loginProvider || "credentials") as string;
+        const externalId = requireDefined(props.token.sub, `JWT token .sub is not defined`);
+        const email = requireDefined(props.token.email, `JWT token .email is not defined`);
+        const user = await getOrCreateUser({
+          externalId,
+          loginProvider,
+          email,
+          name: props.token.name || email,
+        });
+        // Log a successful login only on the initial sign-in call, not on every JWT refresh.
+        // NextAuth populates `user` on first call; subsequent calls only carry `token`.
+        if (props.user) {
+          try {
+            await authAuditLog(
+              { internalId: user.id, email: user.email || email, name: user.name || email },
+              "login",
+              `nextauth-${loginProvider}`,
+              undefined,
+              req
+            );
+            await trackAuthEvent(
+              { internalId: user.id, email: user.email || email, name: user.name || email, externalId },
+              "login",
+              `nextauth-${loginProvider}`
+            );
+          } catch (err) {
+            log.atError().withCause(err).log("Failed to record login audit event");
+          }
+        }
+        return {
+          internalId: user.id,
+          externalId: externalId,
+          mustChangePassword: user.mustChangePassword,
+          externalUsername: props.profile?.["login"],
+          loginProvider: loginProvider,
+          ...props.token,
+        };
+      },
+      async session({ session, token }) {
+        return {
+          ...session,
+          mustChangePassword: token.mustChangePassword,
+          internalId: token.internalId,
+          loginProvider: token.loginProvider,
+          externalId: token.externalId,
+          externalUsername: token.externalUsername,
+        };
+      },
+    },
+  };
+}
+
+// Static config for consumers that only need `.secret` or read an existing
+// session via getServerSession — neither fires the login/logout events, so
+// there's no request to carry.
+export const nextAuthConfig: NextAuthOptions = buildNextAuthConfig();
+
+// Per-request config for the NextAuth handler (pages/api/auth/[...nextauth].ts).
+// Carries `req` into the signOut/jwt events so login & logout audit rows get
+// ip + headers instead of NULL.
+export function nextAuthConfigForRequest(req: NextApiRequest): NextAuthOptions {
+  return buildNextAuthConfig(req);
+}
